@@ -1,0 +1,84 @@
+[package]
+name = "oxiphoton"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+description = "Pure Rust Computational Photonics & Optical Simulation Framework"
+repository = "https://github.com/cool-japan/oxiphoton"
+authors = ["COOLJAPAN OU (Team Kitasan)"]
+documentation = "https://docs.rs/oxiphoton"
+homepage = "https://github.com/cool-japan/oxiphoton"
+keywords = ["photonics", "fdtd", "optics", "simulation", "photonic"]
+categories = ["science", "simulation"]
+readme = "README.md"
+
+[dependencies]
+num-complex = { version = "0.4.6", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+rayon = { version = "1.11.0", optional = true }
+bytemuck = { version = "1.25.0", features = ["derive"] }
+oxiblas = "0.2.0"
+oxifft = "0.1.3"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1.10.0"
+approx = "0.5"
+
+[features]
+default = ["std", "smatrix", "fdtd", "fdtd-3d", "dispersive", "rcwa", "materials-builtin", "mode-solver", "bpm", "siph-devices", "ray-optics", "photonic-crystal", "fiber", "solar-optics"]
+std = []
+no_std_compat = []
+
+# Solvers
+fdtd = []
+fdtd-3d = ["fdtd"]
+bpm = []
+smatrix = []
+rcwa = ["smatrix"]
+mode-solver = []
+ray-optics = []
+
+# Physics
+dispersive = ["fdtd"]
+nonlinear = ["fdtd"]
+photonic-crystal = []
+
+# Devices
+siph-devices = ["mode-solver"]
+metalens = ["fdtd", "rcwa"]
+fiber = ["mode-solver"]
+interconnect = ["siph-devices"]
+solar-optics = ["smatrix"]
+
+# Inverse design
+inverse-design = ["fdtd"]
+topology-opt = ["inverse-design"]
+
+# Materials
+materials-builtin = []
+
+# I/O
+io-gds = []
+io-vtk = []
+io-hdf5 = []
+io-oxirs = []
+
+# Performance
+simd = []
+parallel = ["std", "rayon"]
+gpu-wgpu = ["std"]
+
+[[bench]]
+name = "smatrix_bench"
+harness = false
+
+[[bench]]
+name = "fdtd_bench"
+harness = false
+
+[[bench]]
+name = "bpm_bench"
+harness = false

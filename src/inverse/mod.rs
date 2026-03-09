@@ -1,0 +1,24 @@
+//! Inverse design and adjoint sensitivity analysis for photonic structures.
+//!
+//! The adjoint method computes the gradient of a figure of merit (FOM)
+//! with respect to all design parameters in two FDTD simulations:
+//!   1. Forward simulation: compute fields E_fwd from source
+//!   2. Adjoint simulation: compute E_adj from adjoint source at monitor
+//!
+//! The gradient is: dFOM/dε(r) = -2ω/c² · Re[E_fwd(r) · E_adj(r)]
+//!
+//! This enables gradient-based optimization of complex photonic structures
+//! using algorithms like L-BFGS or Adam.
+pub mod adjoint;
+pub mod fabrication;
+pub mod parametric;
+pub mod shape;
+pub mod topology;
+
+pub use adjoint::{AdjointSolver, DesignRegion, FomGradient};
+pub use fabrication::{CurvaturePenalty, FabricationConstraints};
+pub use parametric::{
+    ConvergenceHistory, MomentumGD, MultiStart, NelderMead, ParametricProblem, Pso,
+};
+pub use shape::{LevelSet, ParametricShape};
+pub use topology::{BinaryProjection, TopologyOptimizer};
