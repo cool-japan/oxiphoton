@@ -11,6 +11,55 @@
 ///   ε(r) = eps_min + ρ̄·(eps_max - eps_min)   — permittivity
 use super::adjoint::DesignRegion;
 
+/// Compute the continuation schedule for β-continuation.
+///
+/// Returns a `Vec` of `(iteration_start, beta)` pairs. After `n_steps_per_beta`
+/// OC iterations at each β level, β doubles (or advances to the next entry).
+///
+/// # Arguments
+/// * `n_steps_per_beta` – number of OC iterations at each β level
+/// * `betas`            – ordered sequence of β values
+pub fn continuation_schedule(n_steps_per_beta: usize, betas: &[f64]) -> Vec<(usize, f64)> {
+    betas
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| (i * n_steps_per_beta, b))
+        .collect()
+}
+
+/// Simple "concentrate density in upper half" figure of merit for integration testing.
+///
+/// FOM = mean(ρ̄\[i\] for i in upper half of grid).
+/// This exercises the full OC pipeline without requiring a real BPM/FDTD solve.
+pub struct Pseudo2dFom {
+    /// Number of pixels in x-direction
+    pub nx: usize,
+    /// Number of pixels in z-direction
+    pub nz: usize,
+}
+
+impl Pseudo2dFom {
+    /// Create a new `Pseudo2dFom` for an `nx × nz` design grid.
+    pub fn new(nx: usize, nz: usize) -> Self {
+        Self { nx, nz }
+    }
+
+    /// Evaluate FOM and compute gradient w.r.t. projected density.
+    ///
+    /// Returns `(fom, grad_projected)` where `grad_projected[i] = dFOM/dρ̄[i]`.
+    pub fn evaluate(&self, projected: &[f64]) -> (f64, Vec<f64>) {
+        let n = self.nx * self.nz;
+        let upper_half_start = n / 2;
+        let n_upper = n - upper_half_start;
+        let fom = projected[upper_half_start..].iter().sum::<f64>() / n_upper as f64;
+        let mut grad = vec![0.0_f64; n];
+        for g in grad.iter_mut().take(n).skip(upper_half_start) {
+            *g = 1.0 / n_upper as f64;
+        }
+        (fom, grad)
+    }
+}
+
 /// Topology optimizer combining filtering, projection, and gradient updates.
 pub struct TopologyOptimizer {
     /// Current design region
@@ -25,6 +74,55 @@ pub struct TopologyOptimizer {
     pub iteration: usize,
     /// History of FOM values
     pub fom_history: Vec<f64>,
+}
+
+/// Compute the mean projected volume fraction for a raw density array.
+///
+/// Applies the Gaussian density filter followed by the Heaviside projection
+/// and returns the mean of the projected values.  This is a pure function that
+/// does NOT require a `TopologyOptimizer` instance, so it can be used in
+/// bisection helpers without cloning the full optimizer.
+fn projected_volume(
+    rho: &[f64],
+    beta: f64,
+    eta: f64,
+    filter_radius: f64,
+    nx: usize,
+    nz: usize,
+) -> f64 {
+    let n = nx * nz;
+    let r = filter_radius;
+    let r_int = r.ceil() as i64;
+    let tanh_b_eta = (beta * eta).tanh();
+    let denom = tanh_b_eta + (beta * (1.0 - eta)).tanh();
+
+    let mut total = 0.0_f64;
+    for j in 0..nz {
+        for i in 0..nx {
+            let mut weight_sum = 0.0_f64;
+            let mut val_sum = 0.0_f64;
+            for dj in -r_int..=r_int {
+                for di in -r_int..=r_int {
+                    let dist2 = (di * di + dj * dj) as f64;
+                    if dist2 > r * r {
+                        continue;
+                    }
+                    let ni = i as i64 + di;
+                    let nj = j as i64 + dj;
+                    if ni < 0 || ni >= nx as i64 || nj < 0 || nj >= nz as i64 {
+                        continue;
+                    }
+                    let w = (-(dist2) / (r * r)).exp();
+                    weight_sum += w;
+                    val_sum += w * rho[nj as usize * nx + ni as usize];
+                }
+            }
+            let filtered_ij = val_sum / weight_sum.max(1e-30);
+            let projected_ij = (tanh_b_eta + (beta * (filtered_ij - eta)).tanh()) / denom;
+            total += projected_ij;
+        }
+    }
+    total / n as f64
 }
 
 impl TopologyOptimizer {
@@ -77,6 +175,244 @@ impl TopologyOptimizer {
         filtered
     }
 
+    /// Adjoint of the density filter: `(F^T u)[i] = Σ_j W_{ij} u[j] / w[j]`
+    ///
+    /// Because the kernel W is symmetric (`W_{ij} = W_{ji}`), the adjoint filter
+    /// is computed by swapping the roles of source and target in the convolution
+    /// while dividing by the *source* pixel's weight sum `w[j]` rather than the
+    /// current pixel's weight sum.
+    ///
+    /// This is the correct transpose of `filter_density` and is needed for the
+    /// full chain-rule when converting a gradient from filtered-density space
+    /// back to raw-density space.
+    pub fn filter_adjoint(&self, du_dfiltered: &[f64]) -> Vec<f64> {
+        let nx = self.region.nx;
+        let nz = self.region.nz;
+        let r = self.filter_radius;
+        let r_int = r.ceil() as i64;
+
+        // Pre-compute weight sums for every pixel (same kernel as filter_density)
+        let mut weight_sums = vec![0.0_f64; nx * nz];
+        for j in 0..nz {
+            for i in 0..nx {
+                let mut ws = 0.0_f64;
+                for dj in -r_int..=r_int {
+                    for di in -r_int..=r_int {
+                        let dist2 = (di * di + dj * dj) as f64;
+                        if dist2 > r * r {
+                            continue;
+                        }
+                        let ni = i as i64 + di;
+                        let nj = j as i64 + dj;
+                        if ni < 0 || ni >= nx as i64 || nj < 0 || nj >= nz as i64 {
+                            continue;
+                        }
+                        ws += (-(dist2) / (r * r)).exp();
+                    }
+                }
+                weight_sums[j * nx + i] = ws.max(1e-30);
+            }
+        }
+
+        // Adjoint: for each raw pixel i, accumulate contributions from all
+        // filtered pixels j that used pixel i in their convolution.
+        // (F^T u)[i] = Σ_j  W_{ij} * u[j] / w[j]
+        // Because W is symmetric W_{ij} = W_{ji}, we iterate over j's neighbourhood
+        // and contribute to i.  Equivalently, loop over i and its neighbourhood j:
+        //   for each neighbour j of i:  result[i] += W_{ij} * u[j] / w[j]
+        let mut result = vec![0.0_f64; nx * nz];
+        for j in 0..nz {
+            for i in 0..nx {
+                let mut acc = 0.0_f64;
+                for dj in -r_int..=r_int {
+                    for di in -r_int..=r_int {
+                        let dist2 = (di * di + dj * dj) as f64;
+                        if dist2 > r * r {
+                            continue;
+                        }
+                        // neighbour pixel (ni, nj) — this is the "j" in (F^T u)[i]
+                        let ni = i as i64 + di;
+                        let nj = j as i64 + dj;
+                        if ni < 0 || ni >= nx as i64 || nj < 0 || nj >= nz as i64 {
+                            continue;
+                        }
+                        let w = (-(dist2) / (r * r)).exp();
+                        let src_idx = nj as usize * nx + ni as usize;
+                        acc += w * du_dfiltered[src_idx] / weight_sums[src_idx];
+                    }
+                }
+                result[j * nx + i] = acc;
+            }
+        }
+        result
+    }
+
+    /// Jacobian of the Heaviside projection `dρ̄/dρ̃` at each pixel.
+    ///
+    ///   `dρ̄/dρ̃ = β · sech²(β·(ρ̃ - η)) / (tanh(β·η) + tanh(β·(1-η)))`
+    ///
+    /// where `sech²(x) = 1 / cosh²(x)`.
+    pub fn projection_jacobian(&self, filtered: &[f64]) -> Vec<f64> {
+        let beta = self.beta;
+        let eta = self.eta;
+        let denom = (beta * eta).tanh() + (beta * (1.0 - eta)).tanh();
+        filtered
+            .iter()
+            .map(|&rho_tilde| {
+                let cx = (beta * (rho_tilde - eta)).cosh();
+                // sech²(x) = 1/cosh²(x)
+                beta / (cx * cx * denom)
+            })
+            .collect()
+    }
+
+    /// Convert gradient w.r.t. projected density (`dFOM/dρ̄`) to gradient
+    /// w.r.t. raw density (`dFOM/dρ_raw`) via the full chain rule:
+    ///
+    ///   `dFOM/dρ_raw = F^T(dρ̄/dρ̃ ⊙ dFOM/dρ̄)`
+    ///
+    /// where `⊙` is element-wise multiplication, `F^T` is the adjoint filter,
+    /// and `dρ̄/dρ̃` is the projection Jacobian.
+    pub fn raw_gradient(&self, grad_projected: &[f64]) -> Vec<f64> {
+        let filtered = self.filter_density();
+        let proj_jac = self.projection_jacobian(&filtered);
+        // dFOM/dρ̃[i] = proj_jac[i] * grad_projected[i]
+        let d_filtered: Vec<f64> = proj_jac
+            .iter()
+            .zip(grad_projected.iter())
+            .map(|(j, g)| j * g)
+            .collect();
+        self.filter_adjoint(&d_filtered)
+    }
+
+    /// Apply one Optimality Criteria update for a given Lagrange multiplier λ.
+    ///
+    /// Helper for `oc_step` bisection — does NOT mutate `self`.
+    fn apply_oc_update(&self, gradient: &[f64], lambda: f64, move_limit: f64) -> Vec<f64> {
+        const RHO_MIN: f64 = 1e-3;
+        const RHO_MAX: f64 = 1.0;
+        self.region
+            .rho
+            .iter()
+            .zip(gradient.iter())
+            .map(|(&rho_i, &g_i)| {
+                let be = (g_i / lambda).max(0.0).sqrt();
+                let rho_candidate = rho_i * be;
+                let rho_clamped_move = rho_candidate.clamp(rho_i - move_limit, rho_i + move_limit);
+                rho_clamped_move.clamp(RHO_MIN, RHO_MAX)
+            })
+            .collect()
+    }
+
+    /// Compute the projected volume fraction that would result from applying the
+    /// OC update with Lagrange multiplier `lambda`.  Does NOT mutate `self`.
+    fn volume_fraction_for_lambda(&self, gradient: &[f64], lambda: f64, move_limit: f64) -> f64 {
+        let rho_new = self.apply_oc_update(gradient, lambda, move_limit);
+        projected_volume(
+            &rho_new,
+            self.beta,
+            self.eta,
+            self.filter_radius,
+            self.region.nx,
+            self.region.nz,
+        )
+    }
+
+    /// Perform one Optimality Criteria step with volume constraint via bisection.
+    ///
+    /// `gradient` should be `dFOM/dρ_raw` (positive = increasing FOM with increasing ρ).
+    /// `target_volume` is the desired mean projected density V* ∈ (0, 1).
+    /// `move_limit` is the maximum allowed change per pixel per step (e.g., 0.2).
+    ///
+    /// Returns `Ok(new_mean_projected_volume)` on convergence, or an error if the
+    /// target volume lies outside the range achievable by the update rule.
+    ///
+    /// Algorithm (Bendsøe & Sigmund 2003):
+    ///   `ρ_new[i] = clamp(clamp(ρ[i] * sqrt(max(0, gradient[i]/λ)), ρ[i]-m, ρ[i]+m), ρ_min, ρ_max)`
+    ///   Bisect λ until |mean(project(filter(ρ_new))) - V*| < 1e-4
+    pub fn oc_step(
+        &mut self,
+        gradient: &[f64],
+        target_volume: f64,
+        move_limit: f64,
+    ) -> Result<f64, crate::error::OxiPhotonError> {
+        const BISECT_TOL: f64 = 1e-4;
+        const MAX_ITER: usize = 50;
+
+        let mut lambda_lo = 1e-9_f64;
+        let mut lambda_hi = 1e9_f64;
+
+        let vol_lo = self.volume_fraction_for_lambda(gradient, lambda_lo, move_limit);
+        let vol_hi = self.volume_fraction_for_lambda(gradient, lambda_hi, move_limit);
+
+        // vol decreases as lambda increases (higher λ penalises expansion more)
+        // so vol_lo >= vol_hi should hold; target must lie in [vol_hi, vol_lo].
+        if !(vol_hi <= target_volume + BISECT_TOL && vol_lo >= target_volume - BISECT_TOL) {
+            // Clamp to the nearest achievable volume rather than hard-fail
+            let rho_new = if (target_volume - vol_hi).abs() < (target_volume - vol_lo).abs() {
+                self.apply_oc_update(gradient, lambda_hi, move_limit)
+            } else {
+                self.apply_oc_update(gradient, lambda_lo, move_limit)
+            };
+            let actual_vol = projected_volume(
+                &rho_new,
+                self.beta,
+                self.eta,
+                self.filter_radius,
+                self.region.nx,
+                self.region.nz,
+            );
+            self.region.rho = rho_new;
+            self.iteration += 1;
+            return Err(crate::error::OxiPhotonError::Convergence(format!(
+                "OC bisection failed to bracket target volume {target_volume:.4}; \
+                 achievable range [{vol_hi:.4}, {vol_lo:.4}], applied nearest ({actual_vol:.4})"
+            )));
+        }
+
+        // Bisect
+        let mut lambda_mid = lambda_lo;
+        for _ in 0..MAX_ITER {
+            lambda_mid = (lambda_lo + lambda_hi) / 2.0;
+            let vol_mid = self.volume_fraction_for_lambda(gradient, lambda_mid, move_limit);
+            if (vol_mid - target_volume).abs() < BISECT_TOL {
+                break;
+            }
+            // Higher lambda → lower volume fraction
+            if vol_mid > target_volume {
+                lambda_lo = lambda_mid;
+            } else {
+                lambda_hi = lambda_mid;
+            }
+        }
+
+        let rho_new = self.apply_oc_update(gradient, lambda_mid, move_limit);
+        let final_vol = projected_volume(
+            &rho_new,
+            self.beta,
+            self.eta,
+            self.filter_radius,
+            self.region.nx,
+            self.region.nz,
+        );
+        self.region.rho = rho_new;
+        self.iteration += 1;
+        Ok(final_vol)
+    }
+
+    /// Update beta from the continuation schedule based on the current iteration.
+    ///
+    /// Scans the schedule (a list of `(iteration_start, beta)` pairs) in reverse
+    /// order and applies the first entry whose `iteration_start ≤ self.iteration`.
+    pub fn apply_continuation(&mut self, schedule: &[(usize, f64)]) {
+        for &(start, beta) in schedule.iter().rev() {
+            if self.iteration >= start {
+                self.beta = beta;
+                break;
+            }
+        }
+    }
+
     /// Apply Heaviside projection to binarise filtered density.
     ///
     ///   ρ̄ = tanh(β·η) + tanh(β·(ρ̃ - η)) / tanh(β·η) + tanh(β·(1-η))  (normalised)
@@ -121,15 +457,32 @@ impl TopologyOptimizer {
         self.binarisation_fraction(0.45) > 0.95
     }
 
-    /// Update design variables using steepest ascent on filtered/projected design.
+    /// Update design variables using the full chain rule through filter and projection.
     ///
-    /// Gradient with respect to raw ρ includes chain rule through filter and projection.
-    pub fn step(&mut self, raw_gradient: &[f64], step_size: f64) {
-        // Apply filter then project
+    /// `dfom_drbar`: gradient of the figure-of-merit w.r.t. the *projected* density ρ̄.
+    /// The chain rule through filter and projection is applied internally:
+    ///   dFOM/dρ_raw = F^T( dρ̄/dρ̃ ⊙ dFOM/dρ̄ )
+    pub fn step(&mut self, dfom_drbar: &[f64], step_size: f64) {
         let filtered = self.filter_density();
-        let _projected = self.project_density(&filtered);
-        // Chain rule: dFOM/dρ_raw = dFOM/dρ̄ · dρ̄/dρ̃ · dρ̃/dρ
-        // Simplified: use raw gradient (full chain rule requires adjoint of filter)
+        let dproj = self.projection_jacobian(&filtered);
+        let dfom_drtilde: Vec<f64> = dfom_drbar
+            .iter()
+            .zip(dproj.iter())
+            .map(|(g, j)| g * j)
+            .collect();
+        let dfom_drho_raw = self.filter_adjoint(&dfom_drtilde);
+        for (rho, &g) in self.region.rho.iter_mut().zip(dfom_drho_raw.iter()) {
+            *rho = (*rho + step_size * g).clamp(0.0, 1.0);
+        }
+        self.iteration += 1;
+    }
+
+    /// Update design variables using a pre-computed raw-density gradient
+    /// (caller has already applied the chain rule through filter + projection).
+    ///
+    /// This is the legacy "simplified" update — use `step()` for the correct
+    /// chain-rule version.
+    pub fn step_with_raw_gradient(&mut self, raw_gradient: &[f64], step_size: f64) {
         for (rho, &g) in self.region.rho.iter_mut().zip(raw_gradient.iter()) {
             *rho = (*rho + step_size * g).clamp(0.0, 1.0);
         }

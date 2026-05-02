@@ -119,27 +119,36 @@ fn eme_transmission_in_unit_range() {
 
 #[test]
 fn smatrix_2x2_identity_cascade() {
+    use num_complex::Complex64;
     let s1 = SMatrix2x2::identity();
     let s2 = SMatrix2x2::identity();
     let combined = s1.cascade(&s2);
-    assert!((combined.s21 - 1.0).abs() < 1e-10);
-    assert!((combined.s12 - 1.0).abs() < 1e-10);
-    assert!(combined.s11.abs() < 1e-10);
-    assert!(combined.s22.abs() < 1e-10);
+    assert!((combined.s21 - Complex64::ONE).norm() < 1e-10);
+    assert!((combined.s12 - Complex64::ONE).norm() < 1e-10);
+    assert!(combined.s11.norm() < 1e-10);
+    assert!(combined.s22.norm() < 1e-10);
 }
 
 #[test]
 fn smatrix_from_overlap_unity() {
+    use num_complex::Complex64;
     let s = SMatrix2x2::from_overlap(1.0);
-    assert!((s.s21 - 1.0).abs() < 1e-10, "Perfect overlap → T=1");
-    assert!(s.s11.abs() < 1e-10, "Perfect overlap → R=0");
+    assert!(
+        (s.s21 - Complex64::ONE).norm() < 1e-10,
+        "Perfect overlap → T=1"
+    );
+    assert!(s.s11.norm() < 1e-10, "Perfect overlap → R=0");
 }
 
 #[test]
 fn smatrix_from_overlap_zero() {
+    use num_complex::Complex64;
     let s = SMatrix2x2::from_overlap(0.0);
-    assert!(s.s21.abs() < 1e-10, "Zero overlap → T=0");
-    assert!((s.s11 - 1.0).abs() < 1e-10, "Zero overlap → R=1");
+    assert!(s.s21.norm() < 1e-10, "Zero overlap → T=0");
+    assert!(
+        (s.s11 - Complex64::ONE).norm() < 1e-10,
+        "Zero overlap → R=1"
+    );
 }
 
 #[test]

@@ -285,23 +285,8 @@ impl ThinFilmAbsorber {
         let sin_d = delta.sin();
         let i = Complex64::new(0.0, 1.0);
 
-        // Fresnel amplitude coefficients at each interface (normal incidence):
-        // r01 = (n0 - n_film)/(n0 + n_film)
-        // r12 = (n_film - n_sub)/(n_film + n_sub)
-        // t01 = 2n0/(n0+n_film),  t12 = 2n_film/(n_film+n_sub)
         let n0c = Complex64::new(n0, 0.0);
         let n3c = Complex64::new(n_sub, 0.0);
-
-        let r01 = (n0c - n_film) / (n0c + n_film);
-        let r12 = (n_film - n3c) / (n_film + n3c);
-        let t01 = 2.0 * n0c / (n0c + n_film);
-        let t12 = 2.0 * n_film / (n_film + n3c);
-
-        // Total amplitude reflection and transmission coefficients (Airy formula):
-        // r_tot = (r01 + r12·exp(2iδ)) / (1 + r01·r12·exp(2iδ))
-        // t_tot = (t01·t12·exp(iδ))    / (1 + r01·r12·exp(2iδ))
-        let exp_i_delta = (i * delta).exp();
-        let exp_2i_delta = (2.0 * i * delta).exp();
 
         // Use the characteristic-matrix approach for numerical stability:
         // M = [[cos(δ), i·sin(δ)/n̂], [i·n̂·sin(δ), cos(δ)]]
@@ -325,9 +310,6 @@ impl ThinFilmAbsorber {
         let numer_t = 2.0 * n0c;
         let t_amp = numer_t / denom;
         let transmittance = ((n_sub / n0) * t_amp.norm_sqr()).clamp(0.0, 1.0 - reflectance);
-
-        // Suppress unused variable warnings for the Airy formula intermediates
-        let _ = (r01, r12, t01, t12, exp_i_delta, exp_2i_delta);
 
         (reflectance, transmittance)
     }
@@ -462,21 +444,35 @@ impl MultiJunction {
 
 // ─── Photon recycling ─────────────────────────────────────────────────────────
 
-/// Photon recycling correction factor for a thick, high-index absorber.
+/// Photon recycling enhancement factor using the Tiedje-Yablonovitch model.
 ///
-/// When radiatively emitted photons are reabsorbed, the effective emission is
-/// reduced by (1 − P_escape), where P_escape is the probability of photon escape.
+/// The escape probability interpolates between the thin-film (Beer-Lambert) and
+/// thick-film (Yablonovitch / Lambertian) limits based on the optical depth
+/// `α · 4n² · d`:
 ///
-/// Simplified model: f_recycle ≈ 1 − (1/(4n²)) for Lambertian surfaces.
+/// ```text
+/// escape_prob(α, d, n) = 1/(4n²) + (1 − 1/(4n²)) · exp(−α · 4n² · d)
+/// ```
+///
+/// Limits:
+///   - Thin (α·4n²·d → 0): escape_prob → 1  →  factor → 1  (no recycling)
+///   - Thick (α·4n²·d → ∞): escape_prob → 1/(4n²)  →  Yablonovitch value
+///
+/// The enhancement factor is defined as:
+///
+/// ```text
+/// f_recycle = 1 / (1 − q · (1 − escape_prob))
+/// ```
 ///
 /// # Arguments
-/// * `q` — internal quantum efficiency (0–1)
-/// * `thickness` — absorber thickness (m); increases self-absorption
-/// * `n` — refractive index of the absorber
-pub fn photon_recycling_factor(q: f64, thickness: f64, n: f64) -> f64 {
-    let escape_probability = 1.0 / (4.0 * n * n);
-    let _ = thickness; // thickness influences self-absorption; simplified model ignores it
-    q * (1.0 - escape_probability)
+/// * `q` — internal radiative quantum efficiency (0–1)
+/// * `alpha` — absorption coefficient at the relevant emission wavelength (m⁻¹)
+/// * `thickness` — absorber thickness (m)
+/// * `n` — real refractive index of the absorber
+pub fn photon_recycling_factor(q: f64, alpha: f64, thickness: f64, n: f64) -> f64 {
+    let four_n2 = 4.0 * n * n;
+    let escape_prob = 1.0 / four_n2 + (1.0 - 1.0 / four_n2) * (-alpha * four_n2 * thickness).exp();
+    1.0 / (1.0 - q * (1.0 - escape_prob))
 }
 
 /// Open-circuit voltage boost from photon recycling (V).
@@ -647,8 +643,11 @@ mod tests {
 
     #[test]
     fn photon_recycling_factor_bounded() {
-        let f = photon_recycling_factor(0.99, 300e-6, 3.5);
-        assert!(f > 0.0 && f < 1.0, "f_recycle={f:.4}");
+        // alpha=1e4 m⁻¹ (c-Si near 800 nm), d=300 µm, n=3.5
+        // Thick limit: escape_prob ≈ 1/(4·3.5²) ≈ 0.0204
+        // factor = 1/(1 − 0.99·(1 − 0.0204)) ≈ 51.5
+        let f = photon_recycling_factor(0.99, 1e4, 300e-6, 3.5);
+        assert!(f > 1.0, "f_recycle={f:.4} should be > 1 in thick limit");
     }
 
     #[test]

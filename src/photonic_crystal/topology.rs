@@ -15,7 +15,10 @@
 //! Topological invariant: Zak phase = π when t₁ < t₂.
 
 use num_complex::Complex64;
+use oxiblas::prelude::{Mat, TridiagEvd};
 use std::f64::consts::PI;
+
+use crate::error::OxiPhotonError;
 
 /// SSH (Su-Schrieffer-Heeger) photonic chain.
 ///
@@ -144,16 +147,54 @@ impl SshChain {
         Self::tridiagonal_eigenvalues(&h, n)
     }
 
-    /// Simple tridiagonal eigenvalue solver (symmetric tridiagonal via recursion).
+    /// Symmetric tridiagonal eigenvalue solver.
+    ///
+    /// Attempts `TridiagEvd` first for better accuracy; falls back to the
+    /// legacy Sturm-bisection path if the eigenpair solver fails.
     fn tridiagonal_eigenvalues(h: &[Vec<f64>], n: usize) -> Vec<f64> {
-        // Extract diag and off-diag
         let diag: Vec<f64> = (0..n).map(|i| h[i][i]).collect();
         let offdiag: Vec<f64> = (0..n.saturating_sub(1)).map(|i| h[i][i + 1]).collect();
-        // QR iteration (simplified bisection for eigenvalue counting)
-        // For small matrices: use Gershgorin to bound eigenvalues
-        // then bisect using Sturm count
-        sturm_bisect_eigenvalues(&diag, &offdiag, n)
+        match eigenpairs_inner(&diag, &offdiag) {
+            Ok((eigs, _)) => eigs,
+            Err(_) => sturm_bisect_eigenvalues(&diag, &offdiag, n),
+        }
     }
+}
+
+/// Compute eigenpairs of a symmetric tridiagonal matrix via `TridiagEvd`.
+///
+/// Returns sorted eigenvalues and the corresponding column-major eigenvector
+/// matrix.  Falls through to the existing Sturm-bisection path only for the
+/// eigenvalue-only callers; the full eigenpair path always uses TridiagEvd.
+fn eigenpairs_inner(
+    diagonal: &[f64],
+    off_diagonal: &[f64],
+) -> Result<(Vec<f64>, Mat<f64>), OxiPhotonError> {
+    let evd = TridiagEvd::compute(diagonal, off_diagonal)
+        .map_err(|e| OxiPhotonError::NumericalError(format!("tridiag evd: {e:?}")))?;
+    let eigs = evd.eigenvalues().to_vec();
+    let vecs = evd
+        .eigenvectors()
+        .ok_or_else(|| {
+            OxiPhotonError::NumericalError("TridiagEvd returned no eigenvectors".to_string())
+        })?
+        .clone();
+    // Debug-only orthogonality check
+    #[cfg(debug_assertions)]
+    {
+        let n = eigs.len();
+        for i in 0..n {
+            for j in 0..n {
+                let dot: f64 = (0..n).map(|r| vecs[(r, i)] * vecs[(r, j)]).sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                debug_assert!(
+                    (dot - expected).abs() < 1e-4,
+                    "eigenvector orthogonality failed: <v{i}|v{j}> = {dot:.6}"
+                );
+            }
+        }
+    }
+    Ok((eigs, vecs))
 }
 
 /// Sturm sequence bisection for symmetric tridiagonal eigenvalues.
@@ -694,6 +735,125 @@ impl SshPhotonicChain {
             + 2.0 * self.kappa1 * self.kappa2 * k.cos();
         let e = e_sq.max(0.0).sqrt();
         [self.omega0 - e, self.omega0 + e]
+    }
+
+    /// Bloch eigenvector at crystal momentum `k` for the given `band_index`.
+    ///
+    /// The SSH bulk Bloch Hamiltonian is:
+    ///
+    ///   H(k) = ⎡  0     h(k) ⎤   with h(k) = κ₁ + κ₂ exp(ik)
+    ///          ⎣ h*(k)   0   ⎦
+    ///
+    /// Eigenvectors (in the sublattice basis):
+    /// * Band 0 (lower):  (1, −h*(k)/|h|) / √2
+    /// * Band 1 (upper):  (1, +h*(k)/|h|) / √2
+    ///
+    /// Returns `Err` for invalid `band_index` or a degenerate point (|h|=0).
+    pub fn bloch_vector(
+        &self,
+        k: f64,
+        band_index: usize,
+    ) -> Result<Vec<Complex64>, OxiPhotonError> {
+        if band_index > 1 {
+            return Err(OxiPhotonError::NumericalError(format!(
+                "band_index {band_index} out of range (SSH has 2 bands: 0 and 1)"
+            )));
+        }
+        // Off-diagonal element of the Bloch Hamiltonian
+        let h = Complex64::new(self.kappa1 + self.kappa2 * k.cos(), self.kappa2 * k.sin());
+        let h_abs = h.norm();
+        if h_abs < 1e-15 {
+            return Err(OxiPhotonError::NumericalError(
+                "degenerate k-point: |h(k)| = 0, Bloch vector undefined".to_string(),
+            ));
+        }
+        // Phase factor e^{iφ} = h / |h|
+        let h_phase = h / h_abs;
+        let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+        // Lower band sign = −1, upper band sign = +1
+        let sign = if band_index == 0 {
+            Complex64::new(-1.0, 0.0)
+        } else {
+            Complex64::new(1.0, 0.0)
+        };
+        // v = (1, sign * conj(h_phase)) / √2
+        let bloch = vec![
+            Complex64::new(inv_sqrt2, 0.0),
+            sign * h_phase.conj() * inv_sqrt2,
+        ];
+        Ok(bloch)
+    }
+
+    /// Compute the Wilson-loop Berry (Zak) phase for `band_index` along a
+    /// discretised 1D Brillouin-zone path.
+    ///
+    /// The SSH Bloch state at each k is a 2-component complex vector.  The
+    /// full inner product ⟨u(k_j)|u(k_{j+1})⟩ = Σ_α u_α*(k_j) u_α(k_{j+1})
+    /// is used for the Wilson-loop product, which then delegates to
+    /// `BerryPhase::compute_wilson_loop` via the scalar-overlap convention.
+    ///
+    /// # Arguments
+    /// * `k_path` – ordered k-points; the path is automatically closed
+    ///   (wraps from the last point back to the first).
+    /// * `band_index` – 0 (lower band) or 1 (upper band).
+    ///
+    /// # Returns
+    /// `Ok(BerryPhase)` whose `berry_phases[0]` is the Zak phase, or `Err`
+    /// if any `bloch_vector` call fails.
+    pub fn wilson_loop_band_n(
+        &self,
+        k_path: &[f64],
+        band_index: usize,
+    ) -> Result<BerryPhase, OxiPhotonError> {
+        let n_k = k_path.len();
+        // Collect per-k Bloch vectors (2-component each).
+        let bloch_vecs: Vec<Vec<Complex64>> = k_path
+            .iter()
+            .map(|&k| self.bloch_vector(k, band_index))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if n_k < 2 {
+            let k_path_2d: Vec<[f64; 2]> = k_path.iter().map(|&k| [k, 0.0]).collect();
+            return Ok(BerryPhase::compute_wilson_loop(
+                &[vec![Complex64::new(1.0, 0.0)]],
+                &k_path_2d,
+            ));
+        }
+
+        // Compute full inner-product overlaps ⟨u(k_j)|u(k_{j+1})⟩ for all j.
+        // Build a single scalar "band" of sequential overlap amplitudes so that
+        // `compute_wilson_loop` can multiply them in a chain.
+        // We encode each link as a single complex number whose argument is the
+        // link phase; the product gives the Wilson loop.
+        let mut link_phases: Vec<Complex64> = Vec::with_capacity(n_k);
+        for j in 0..n_k {
+            let j_next = (j + 1) % n_k;
+            let u_j = &bloch_vecs[j];
+            let u_next = &bloch_vecs[j_next];
+            // ⟨u_j|u_{j+1}⟩ = Σ_α conj(u_j[α]) * u_{j+1}[α]
+            let overlap: Complex64 = u_j
+                .iter()
+                .zip(u_next.iter())
+                .map(|(&a, &b)| a.conj() * b)
+                .sum();
+            link_phases.push(overlap);
+        }
+
+        // Wilson-loop product W = ∏ (overlap / |overlap|)
+        let mut w = Complex64::new(1.0, 0.0);
+        for lp in &link_phases {
+            let norm = lp.norm();
+            if norm > 1e-30 {
+                w *= lp / norm;
+            }
+        }
+        let phase = -w.arg();
+
+        let k_path_2d: Vec<[f64; 2]> = k_path.iter().map(|&k| [k, 0.0]).collect();
+        Ok(BerryPhase {
+            k_path: k_path_2d,
+            berry_phases: vec![phase],
+        })
     }
 }
 

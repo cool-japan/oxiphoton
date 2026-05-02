@@ -1,6 +1,8 @@
 use num_complex::Complex64;
 use std::f64::consts::PI;
 
+use crate::smatrix::interface::mat_inv_full_nd;
+
 /// Type alias for a 2D complex matrix (N×N S-matrix block).
 pub type CMatrix = Vec<Vec<Complex64>>;
 
@@ -34,6 +36,17 @@ impl EmeMode {
     /// Compute field norm ∫|E|²dx
     pub fn norm(&self) -> f64 {
         self.field.iter().map(|&e| e * e).sum::<f64>() * self.dx
+    }
+
+    /// Power normalisation factor for a TE-slab mode: (β / 2·ω·μ₀) · ∫|E_y|² dx.
+    ///
+    /// Returns the Poynting power carried by the mode field per unit width.
+    /// Each mode carries unit power when its field samples are divided by `sqrt(power_norm(ω))`.
+    pub fn power_norm(&self, omega: f64) -> f64 {
+        use std::f64::consts::PI;
+        const MU_0: f64 = 4.0 * PI * 1e-7;
+        let integral: f64 = self.field.iter().map(|&e| e * e).sum::<f64>() * self.dx;
+        self.beta / (2.0 * omega * MU_0) * integral
     }
 
     /// Overlap integral with another mode: ∫E_1·E_2 dx / sqrt(N1·N2)
@@ -401,40 +414,36 @@ impl EmeSegment {
 ///   \[b-\] = [S21 S22] \[a-\]
 ///
 /// Convention: port 1 is left, port 2 is right.
+/// Fields are Complex64 to correctly represent the phase accumulated by propagation.
 #[derive(Debug, Clone)]
 pub struct SMatrix2x2 {
-    pub s11: f64,
-    pub s12: f64,
-    pub s21: f64,
-    pub s22: f64,
+    pub s11: Complex64,
+    pub s12: Complex64,
+    pub s21: Complex64,
+    pub s22: Complex64,
 }
 
 impl SMatrix2x2 {
     /// Identity S-matrix (perfectly transmitting, no reflection)
     pub fn identity() -> Self {
         Self {
-            s11: 0.0,
-            s12: 1.0,
-            s21: 1.0,
-            s22: 0.0,
+            s11: Complex64::ZERO,
+            s12: Complex64::ONE,
+            s21: Complex64::ONE,
+            s22: Complex64::ZERO,
         }
     }
 
     /// Propagation S-matrix for a segment of length L and propagation constant beta.
+    ///
+    /// For a lossless segment: S21 = exp(i·β·L), S12 = exp(i·β·L), S11 = S22 = 0.
     pub fn propagation(beta: f64, length: f64) -> Self {
-        let phase = (beta * length).cos(); // real part only (lossless)
-        let _ = phase;
-        let t = (beta * length).cos() * (beta * length).cos()
-            + (beta * length).sin() * (beta * length).sin();
-        // For a lossless segment: T = exp(i*beta*L), |T|² = 1
-        // S-parameters: S21 = exp(i*beta*L), S12 = exp(-i*beta*L), S11=S22=0
-        // Taking magnitude (real-valued EME approximation):
-        let _ = t;
+        let phase = Complex64::new(0.0, beta * length).exp();
         Self {
-            s11: 0.0,
-            s12: 1.0,
-            s21: 1.0,
-            s22: 0.0,
+            s11: Complex64::ZERO,
+            s12: phase,
+            s21: phase,
+            s22: Complex64::ZERO,
         }
     }
 
@@ -446,23 +455,26 @@ impl SMatrix2x2 {
         let t = eta.powi(2).min(1.0);
         let r = 1.0 - t;
         Self {
-            s11: r.sqrt(),
-            s12: t.sqrt(),
-            s21: t.sqrt(),
-            s22: r.sqrt(),
+            s11: Complex64::new(r.sqrt(), 0.0),
+            s12: Complex64::new(t.sqrt(), 0.0),
+            s21: Complex64::new(t.sqrt(), 0.0),
+            s22: Complex64::new(r.sqrt(), 0.0),
         }
     }
 
     /// Cascade two S-matrices (Redheffer star product).
     pub fn cascade(&self, other: &Self) -> Self {
-        // For real-valued S-matrices:
-        // S = S_A ⊕ S_B
-        // S21_total = S21_B * S21_A / (1 - S22_A * S11_B)
-        let denom = 1.0 - self.s22 * other.s11;
-        let denom = if denom.abs() < 1e-30 { 1.0 } else { denom };
-        let s21 = self.s21 * other.s21 / denom;
-        let s12 = other.s12 * self.s12 / denom;
+        // Redheffer star product for complex S-matrices:
+        // denom = 1 - S22_A * S11_B
+        let denom = Complex64::ONE - self.s22 * other.s11;
+        let denom = if denom.norm() < 1e-30 {
+            Complex64::ONE
+        } else {
+            denom
+        };
         let s11 = self.s11 + self.s12 * other.s11 * self.s21 / denom;
+        let s12 = self.s12 * other.s12 / denom;
+        let s21 = other.s21 * self.s21 / denom;
         let s22 = other.s22 + other.s21 * self.s22 * other.s12 / denom;
         Self { s11, s12, s21, s22 }
     }
@@ -564,7 +576,7 @@ impl EmeSolver {
     /// Total power transmission (fundamental mode in → fundamental mode out).
     pub fn transmission(&self) -> f64 {
         let s = self.solve_fundamental();
-        s.s21 * s.s21
+        s.s21.norm_sqr()
     }
 }
 
@@ -808,24 +820,6 @@ pub fn eye_nd(n: usize) -> Vec<Vec<Complex64>> {
     e
 }
 
-/// Diagonal approximation to matrix inverse.
-///
-/// Valid for diagonally dominant matrices (e.g., weakly-coupled modes).
-/// For strongly coupled systems, a full LU factorisation should be used.
-fn diag_inv_nd(m: &[Vec<Complex64>]) -> Vec<Vec<Complex64>> {
-    let n = m.len();
-    let mut result = vec![vec![Complex64::new(0.0, 0.0); n]; n];
-    for i in 0..n {
-        let d = m[i][i];
-        result[i][i] = if d.norm_sqr() < 1e-200 {
-            Complex64::new(1.0, 0.0)
-        } else {
-            Complex64::new(1.0, 0.0) / d
-        };
-    }
-    result
-}
-
 /// Redheffer star product for N×N S-matrices.
 ///
 /// Cascades S_A and S_B into S_total following:
@@ -837,8 +831,9 @@ fn diag_inv_nd(m: &[Vec<Complex64>]) -> Vec<Vec<Complex64>> {
 ///   new_S21 = S21_B · D₁ · S21_A
 ///   new_S12 = S12_A · D₂ · S12_B
 ///
-/// The inverse is approximated as a diagonal approximation for weakly-coupled
-/// mode sets. All input blocks must be N×N.
+/// The inverses D₁ and D₂ are computed via full Gauss-Jordan elimination with
+/// partial pivoting (`mat_inv_full_nd`), falling back to the identity on
+/// singular inputs. All input blocks must be N×N.
 #[allow(clippy::too_many_arguments)]
 pub fn cascade_smatrices(
     s11_a: &[Vec<Complex64>],
@@ -852,18 +847,18 @@ pub fn cascade_smatrices(
 ) -> SMatrixBlocks {
     let n = s11_a.len();
     let id = eye_nd(n);
-    // D1 = (I − S22_A · S11_B)⁻¹
+    // D1 = (I − S22_A · S11_B)⁻¹  (full Gauss-Jordan inverse; falls back to I on singular)
     let s22a_s11b = mat_mul_nd(s22_a, s11_b);
     let id_minus1: Vec<Vec<Complex64>> = (0..n)
         .map(|i| (0..n).map(|j| id[i][j] - s22a_s11b[i][j]).collect())
         .collect();
-    let d1 = diag_inv_nd(&id_minus1);
+    let d1 = mat_inv_full_nd(id_minus1).unwrap_or_else(|_| eye_nd(n));
     // D2 = (I − S11_B · S22_A)⁻¹
     let s11b_s22a = mat_mul_nd(s11_b, s22_a);
     let id_minus2: Vec<Vec<Complex64>> = (0..n)
         .map(|i| (0..n).map(|j| id[i][j] - s11b_s22a[i][j]).collect())
         .collect();
-    let d2 = diag_inv_nd(&id_minus2);
+    let d2 = mat_inv_full_nd(id_minus2).unwrap_or_else(|_| eye_nd(n));
     // new_S11 = S11_A + S12_A · D1 · S11_B · S21_A
     let new_s11 = mat_add_nd(
         s11_a,
@@ -1002,10 +997,10 @@ mod tests {
         let s1 = SMatrix2x2::identity();
         let s2 = SMatrix2x2::identity();
         let s = s1.cascade(&s2);
-        assert!((s.s12 - 1.0).abs() < 1e-10);
-        assert!((s.s21 - 1.0).abs() < 1e-10);
-        assert!(s.s11.abs() < 1e-10);
-        assert!(s.s22.abs() < 1e-10);
+        assert!((s.s12 - Complex64::ONE).norm() < 1e-10);
+        assert!((s.s21 - Complex64::ONE).norm() < 1e-10);
+        assert!(s.s11.norm() < 1e-10);
+        assert!(s.s22.norm() < 1e-10);
     }
 
     #[test]
@@ -1604,8 +1599,8 @@ mod tests {
     fn smatrix_2x2_from_overlap_energy_conserved() {
         let eta = 0.8_f64;
         let s = SMatrix2x2::from_overlap(eta);
-        let r_sq = s.s11 * s.s11;
-        let t_sq = s.s21 * s.s21;
+        let r_sq = s.s11.norm_sqr();
+        let t_sq = s.s21.norm_sqr();
         assert!((r_sq + t_sq - 1.0).abs() < 1e-10, "R+T={}", r_sq + t_sq);
     }
 }

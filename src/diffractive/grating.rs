@@ -654,9 +654,20 @@ impl VolumeBraggGrating {
 
 /// Dammann grating: binary phase grating for uniform multi-spot beam splitting.
 ///
-/// Designed for splitting a single beam into N² equally spaced, equally intense spots.
-/// The transition points (phase-flip positions) within one period are optimized
-/// so that |ĝ(m)|² = 1/N for m = -N/2+1 .. N/2.
+/// Designed for splitting a single beam into N equally spaced, equally intense spots.
+/// Transition points (phase-flip positions within one period `[0,1]`) are found by a
+/// Levenberg–Marquardt optimiser that minimises diffraction-order intensity variance.
+///
+/// The optimiser enforces half-wave antisymmetry (f(x+0.5) = −f(x)), which
+/// guarantees that all even-order Fourier coefficients vanish.  It operates on
+/// K = `n_orders` free parameters in [0, 0.5) and mirrors them to form the full
+/// 2K-transition set stored in `optimised_transitions`.
+///
+/// After calling [`optimize_transitions`](DammannGrating::optimize_transitions),
+/// [`efficiency`](DammannGrating::efficiency) and
+/// [`uniformity`](DammannGrating::uniformity) are based on Fourier coefficients
+/// of the optimised profile.  Before optimisation they fall back to the hard-coded
+/// analytical table for N ≤ 5.
 #[derive(Debug, Clone)]
 pub struct DammannGrating {
     /// Grating period Λ (μm)
@@ -665,6 +676,13 @@ pub struct DammannGrating {
     pub n_spots: usize,
     /// Design wavelength (nm)
     pub wavelength_nm: f64,
+    /// Optimised full-period transition points from `optimize_transitions()`.
+    /// `None` until the LM optimiser has been run.
+    optimised_transitions: Option<Vec<f64>>,
+    /// Number of orders used in the last `optimize_transitions()` call.
+    /// Stored so that `efficiency()` / `uniformity()` can refer to the same
+    /// set of orders without requiring a parameter.
+    optimised_n_orders: usize,
 }
 
 impl DammannGrating {
@@ -674,17 +692,27 @@ impl DammannGrating {
             period_um,
             n_spots: n_spots.max(1),
             wavelength_nm: lambda_nm,
+            optimised_transitions: None,
+            optimised_n_orders: 0,
         }
     }
 
-    /// Normalized transition points within one period [0, 1].
+    /// Normalised transition points within one period [0, 1].
     ///
-    /// For N spots, the optimal transition points are derived analytically.
-    /// This implementation uses the closed-form solutions for N = 1–5 and
-    /// a uniform-spacing approximation for larger N.
+    /// Returns the LM-optimised transitions if `optimize_transitions()` has
+    /// been called, otherwise the hard-coded analytical solutions for N ≤ 5
+    /// or a uniform-spacing approximation for larger N.
     ///
     /// Reference: Dammann & Görtler, Opt. Commun. 3 (1971) 312.
     pub fn transition_points(&self) -> Vec<f64> {
+        if let Some(ref t) = self.optimised_transitions {
+            return t.clone();
+        }
+        self.table_transition_points()
+    }
+
+    /// Hard-coded / analytical table of transition points.
+    fn table_transition_points(&self) -> Vec<f64> {
         match self.n_spots {
             1 => vec![],
             2 => vec![0.5],
@@ -701,18 +729,328 @@ impl DammannGrating {
         }
     }
 
-    /// Theoretical maximum efficiency for N uniform spots: η ≈ sinc²(1/N) for binary phase.
+    /// Return a reference to the optimised transition points, if available.
+    pub fn get_optimised_transitions(&self) -> Option<&[f64]> {
+        self.optimised_transitions.as_deref()
+    }
+
+    // -----------------------------------------------------------------------
+    // Fourier-coefficient machinery
+    // -----------------------------------------------------------------------
+
+    /// Compute the complex Fourier coefficients c_0, c_1, …, c_{m_max} of the
+    /// binary ±1 grating profile defined by `transitions`.
     ///
-    /// For a perfect N-spot Dammann grating, each spot has intensity 1/N.
-    /// The total efficiency (fraction of incident power in desired orders) is
-    /// approximately 1/N × N = well below 1 for large N due to zeroth order leakage.
+    /// The profile is +1 on [0, transitions[0]), −1 on [transitions[0], transitions[1]),
+    /// and so on, alternating sign at each transition.
+    ///
+    /// The coefficients are computed by direct integration of each strip:
+    ///
+    ///   c_m = Σ_i sign_i · ∫_{a_i}^{b_i} e^{−j2πmx} dx
+    ///       = Σ_i sign_i · (e^{−j2πm a_i} − e^{−j2πm b_i}) / (j2πm)
+    ///
+    /// DC (m = 0): c_0 = Σ_i sign_i · (b_i − a_i).
+    fn fourier_coefficients_static(
+        transitions: &[f64],
+        m_max: usize,
+    ) -> Vec<num_complex::Complex64> {
+        // Build strip boundary array: [0, t_1, t_2, …, t_K, 1]
+        // The transitions are assumed sorted.
+        let boundaries: Vec<f64> = {
+            let mut b = Vec::with_capacity(transitions.len() + 2);
+            b.push(0.0_f64);
+            b.extend_from_slice(transitions);
+            b.push(1.0_f64);
+            b
+        };
+        let n_strips = boundaries.len() - 1;
+
+        let mut coeffs = Vec::with_capacity(m_max + 1);
+
+        // DC coefficient: c_0 = integral of the profile = Σ sign_i * width_i
+        let c0_real: f64 = (0..n_strips)
+            .map(|i| {
+                let sign = if i % 2 == 0 { 1.0_f64 } else { -1.0_f64 };
+                sign * (boundaries[i + 1] - boundaries[i])
+            })
+            .sum();
+        coeffs.push(num_complex::Complex64::new(c0_real, 0.0));
+
+        // Non-zero orders m = 1 … m_max.
+        for m in 1..=m_max {
+            let mf = m as f64;
+            let two_pi_m = 2.0 * PI * mf;
+            let mut c_re = 0.0_f64;
+            let mut c_im = 0.0_f64;
+
+            for i in 0..n_strips {
+                let sign = if i % 2 == 0 { 1.0_f64 } else { -1.0_f64 };
+                let angle_a = two_pi_m * boundaries[i];
+                let angle_b = two_pi_m * boundaries[i + 1];
+                // ∫_a^b e^{-j2πmx} dx = (e^{-ja} - e^{-jb}) / (j*2πm)
+                // numerator: (cos a - cos b) - j*(sin a - sin b)
+                let num_re = angle_a.cos() - angle_b.cos();
+                let num_im = -(angle_a.sin() - angle_b.sin());
+                // divide by j*two_pi_m: (re + j*im)/(j*d) = im/d - j*re/d
+                c_re += sign * (num_im / two_pi_m);
+                c_im += sign * (-num_re / two_pi_m);
+            }
+            coeffs.push(num_complex::Complex64::new(c_re, c_im));
+        }
+        coeffs
+    }
+
+    /// Expand K half-period transition points to the full 2K-point set by
+    /// mirroring: [t_1,…,t_K] → [t_1,…,t_K, t_1+0.5,…,t_K+0.5] (sorted).
+    ///
+    /// This enforces half-wave antisymmetry f(x+0.5) = −f(x), which causes
+    /// all even-order Fourier coefficients to vanish exactly.
+    fn half_to_full_transitions(half: &[f64]) -> Vec<f64> {
+        let mut full = Vec::with_capacity(2 * half.len());
+        for &t in half {
+            full.push(t);
+        }
+        for &t in half {
+            full.push(t + 0.5);
+        }
+        full.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        full
+    }
+
+    /// Compute the complex Fourier coefficients c_0, c_1, …, c_{m_max} of the
+    /// grating's binary phase profile.
+    ///
+    /// Uses optimised transition points if available, otherwise falls back to
+    /// the hard-coded table.
+    pub fn fourier_coefficients(&self, m_max: usize) -> Vec<num_complex::Complex64> {
+        let tp = self.transition_points();
+        Self::fourier_coefficients_static(&tp, m_max)
+    }
+
+    // -----------------------------------------------------------------------
+    // LM optimiser internals
+    // -----------------------------------------------------------------------
+
+    /// Cost function and gradient for the *half-period* transition vector `half`.
+    ///
+    /// Internally expands to a full 2K-transition set (half-wave symmetric).
+    /// The cost targets the first `n_orders` *odd* diffraction orders
+    /// (m = 1, 3, 5, …, 2·n_orders−1), minimising their intensity variance:
+    ///
+    ///   J = (1/N) · Σ_{k=1..N} (|c_{2k−1}|² − target)²  +  10³·Σ mono_violations²
+    ///
+    /// where target = Σ|c_{2k−1}|² / N.
+    ///
+    /// Gradient computed with 5-point central-difference stencil (h = 1e-6).
+    fn cost_and_grad_half(half: &[f64], n_orders: usize) -> (f64, Vec<f64>) {
+        let m_max_odd = 2 * n_orders - 1; // largest odd order we care about
+
+        let cost = |h_pts: &[f64]| -> f64 {
+            let full = Self::half_to_full_transitions(h_pts);
+            let coeffs = Self::fourier_coefficients_static(&full, m_max_odd);
+            // Power in each target odd order m = 1, 3, ..., 2*n-1
+            let powers: Vec<f64> = (0..n_orders)
+                .map(|k| coeffs[2 * k + 1].norm_sqr())
+                .collect();
+            let target = powers.iter().sum::<f64>() / n_orders as f64;
+            let variance =
+                powers.iter().map(|&p| (p - target).powi(2)).sum::<f64>() / n_orders as f64;
+            // Soft monotonicity penalty in half-period domain
+            let mono_pen: f64 = h_pts
+                .windows(2)
+                .map(|w| (w[0] - w[1]).max(0.0).powi(2))
+                .sum();
+            variance + 1e3 * mono_pen
+        };
+
+        let j0 = cost(half);
+        let h = 1e-6_f64;
+        let mut grad = vec![0.0_f64; half.len()];
+        let mut h_pert = half.to_vec();
+        for i in 0..half.len() {
+            h_pert[i] = half[i] + 2.0 * h;
+            let jp2 = cost(&h_pert);
+            h_pert[i] = half[i] + h;
+            let jp1 = cost(&h_pert);
+            h_pert[i] = half[i] - h;
+            let jm1 = cost(&h_pert);
+            h_pert[i] = half[i] - 2.0 * h;
+            let jm2 = cost(&h_pert);
+            h_pert[i] = half[i]; // restore
+            grad[i] = (-jp2 + 8.0 * jp1 - 8.0 * jm1 + jm2) / (12.0 * h);
+        }
+        (j0, grad)
+    }
+
+    /// Run a Levenberg–Marquardt optimiser to find transition points that
+    /// uniformly distribute power across `n_orders` diffraction orders.
+    ///
+    /// The optimiser works on K = `n_orders` *half-period* free parameters in
+    /// [0, 0.5) and mirrors them to produce the full 2K-transition set.  This
+    /// enforces half-wave antisymmetry, making all even-order coefficients zero.
+    ///
+    /// A 5-restart multi-start strategy is used to reduce the risk of local
+    /// minima.  The optimised transitions are stored and used by
+    /// [`efficiency`](DammannGrating::efficiency),
+    /// [`uniformity`](DammannGrating::uniformity), and
+    /// [`transition_points`](DammannGrating::transition_points).
+    ///
+    /// Returns the final cost J (0 = perfect uniform splitter).
+    ///
+    /// # Errors
+    /// Returns [`OxiPhotonError::Convergence`] if `n_orders` is 0.
+    pub fn optimize_transitions(
+        &mut self,
+        n_orders: usize,
+    ) -> Result<f64, crate::error::OxiPhotonError> {
+        if n_orders == 0 {
+            return Err(crate::error::OxiPhotonError::Convergence(
+                "n_orders must be ≥ 1".to_owned(),
+            ));
+        }
+
+        let k = n_orders; // free parameters in [0, 0.5)
+        let default_seed: Vec<f64> = (1..=k).map(|i| i as f64 / (2 * k + 2) as f64).collect();
+
+        let mut best_half = default_seed.clone();
+        let mut best_j = f64::INFINITY;
+
+        for restart in 0..5_usize {
+            let mut x: Vec<f64> = if restart == 0 {
+                default_seed.clone()
+            } else {
+                // Deterministic perturbation without external RNG.
+                let seed = restart as f64 * 0.09;
+                (1..=k)
+                    .map(|i| {
+                        let base = i as f64 / (2 * k + 2) as f64;
+                        (base + seed * (i as f64 * 1.618).sin()).clamp(0.001, 0.498)
+                    })
+                    .collect()
+            };
+            // Ensure initial point is sorted (monotone).
+            x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut mu = 1e-2_f64; // LM damping parameter
+
+            for _iter in 0..300_usize {
+                let (j, grad) = Self::cost_and_grad_half(&x, n_orders);
+                let gnorm = grad.iter().map(|g| g.abs()).fold(0.0_f64, f64::max);
+                if gnorm < 1e-12 {
+                    break;
+                }
+
+                // Gradient-descent step with LM damping.
+                let x_new: Vec<f64> = x
+                    .iter()
+                    .zip(grad.iter())
+                    .map(|(&xi, &gi)| (xi - gi / (1.0 + mu)).clamp(0.001, 0.498))
+                    .collect();
+                let (j_new, _) = Self::cost_and_grad_half(&x_new, n_orders);
+                if j_new < j {
+                    x = x_new;
+                    // Keep x sorted to maintain monotonicity in the half domain.
+                    x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    mu *= 0.5_f64.max(1e-12);
+                } else {
+                    mu *= 2.0;
+                    if mu > 1e12 {
+                        break;
+                    }
+                }
+            }
+
+            let (j_final, _) = Self::cost_and_grad_half(&x, n_orders);
+            if j_final < best_j {
+                best_j = j_final;
+                best_half = x;
+            }
+        }
+
+        // Expand half-period to full period and store.
+        let full = Self::half_to_full_transitions(&best_half);
+        self.optimised_transitions = Some(full);
+        self.optimised_n_orders = n_orders;
+        Ok(best_j)
+    }
+
+    // -----------------------------------------------------------------------
+    // Metrics
+    // -----------------------------------------------------------------------
+
+    /// Total diffraction efficiency: fraction of input power in all non-DC
+    /// diffraction orders (both positive and negative).
+    ///
+    /// For a real grating c_{−m} = c_m*, so |c_{−m}|² = |c_m|².  Efficiency
+    /// is therefore 2·Σ_{m=1..N}|c_m|² where N = `optimised_n_orders` (when
+    /// optimised) or `n_spots` (otherwise).
+    ///
+    /// Uses optimised transitions when available.
     pub fn efficiency(&self) -> f64 {
-        let n = self.n_spots as f64;
-        // Theoretical efficiency: each spot receives ~1/n² of input (for 2D)
-        // 1D efficiency: sinc²(1/n) * ...
-        // Simplified: η_1D = sin²(π/n)/(π/n)² for a binary grating
-        let x = 1.0 / n;
-        sinc_sq(x)
+        let tp = self.transition_points();
+        let n = if self.optimised_transitions.is_some() {
+            self.optimised_n_orders.max(1)
+        } else {
+            self.n_spots
+        };
+        // Use enough harmonics to capture all target orders.
+        let m_max = if self.optimised_transitions.is_some() {
+            2 * n - 1 // highest odd order for half-wave symmetric design
+        } else {
+            n
+        };
+        let coeffs = Self::fourier_coefficients_static(&tp, m_max);
+        // Bilateral: include both +m and −m orders.
+        2.0 * coeffs[1..].iter().map(|c| c.norm_sqr()).sum::<f64>()
+    }
+
+    /// Uniformity metric: min(|c_m|²) / max(|c_m|²) over the target non-DC
+    /// diffraction orders.
+    ///
+    /// Returns 1.0 (perfect) when all target-order Fourier powers are equal,
+    /// and 0.0 when max power is negligible.
+    ///
+    /// For the optimised half-wave design, only odd orders m = 1, 3, …,
+    /// 2·n_orders−1 are considered (even orders are identically zero).
+    ///
+    /// Uses optimised transitions when available.
+    pub fn uniformity(&self) -> f64 {
+        let tp = self.transition_points();
+        let n = if self.optimised_transitions.is_some() {
+            self.optimised_n_orders.max(1)
+        } else {
+            self.n_spots
+        };
+        let m_max = if self.optimised_transitions.is_some() {
+            2 * n - 1
+        } else {
+            n
+        };
+        let coeffs = Self::fourier_coefficients_static(&tp, m_max);
+        // For optimised design, compare only odd orders (non-zero by construction).
+        let powers: Vec<f64> = if self.optimised_transitions.is_some() {
+            (0..n).map(|k| coeffs[2 * k + 1].norm_sqr()).collect()
+        } else {
+            coeffs[1..].iter().map(|c| c.norm_sqr()).collect()
+        };
+        if powers.is_empty() {
+            return 1.0;
+        }
+        let min = powers.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = powers.iter().cloned().fold(0.0_f64, f64::max);
+        if max < 1e-30 {
+            0.0
+        } else {
+            min / max
+        }
+    }
+
+    /// Non-uniformity metric: 1 − uniformity().
+    ///
+    /// Returns 0.0 for a perfect grating and approaches 1.0 for a highly
+    /// non-uniform design.
+    pub fn nonuniformity_metric(&self, _n_orders: usize) -> f64 {
+        1.0 - self.uniformity()
     }
 
     /// Diffraction angle for spot index (signed order m) (rad).
@@ -726,23 +1064,282 @@ impl DammannGrating {
         }
         arg.asin()
     }
+}
 
-    /// Uniformity metric: relative intensity variation (0 = perfect, 1 = poor).
+// ---------------------------------------------------------------------------
+// VolumeGrating
+// ---------------------------------------------------------------------------
+
+/// Volume holographic transmission grating (index-modulated thick medium).
+///
+/// Models a transmission-mode volume phase hologram whose diffraction is
+/// described by Raman-Nath theory (thin regime) **and** by Kogelnik's
+/// coupled-wave theory (thick / off-Bragg regime).
+///
+/// Unit conventions: all distances in metres (SI).
+///
+/// References:
+/// - Kogelnik, H. "Coupled Wave Theory for Thick Hologram Gratings" Bell Syst. Tech. J. 48, 2909 (1969)
+/// - Abramowitz & Stegun, "Handbook of Mathematical Functions", §9.1 Bessel recurrences
+#[derive(Debug, Clone)]
+pub struct VolumeGrating {
+    /// Peak refractive-index modulation amplitude Δn (dimensionless)
+    pub delta_n: f64,
+    /// Physical thickness of the holographic layer d (m)
+    pub thickness_m: f64,
+    /// Bragg (design) wavelength λ_B (m)
+    pub bragg_wavelength_m: f64,
+    /// Grating period Λ_g (m)
+    pub period_m: f64,
+    /// Bragg angle θ_B (rad) — angle of incidence inside the medium at Bragg resonance
+    pub bragg_angle_rad: f64,
+}
+
+impl VolumeGrating {
+    /// Create a new volume grating.
     ///
-    /// A perfect Dammann grating has uniformity = 0 (all spots equal).
-    /// Manufacturing imperfections lead to non-zero values.
-    /// This model returns a theoretical estimate based on binary phase quantization.
-    pub fn uniformity(&self) -> f64 {
-        let n = self.n_spots as f64;
-        // Theoretical residual non-uniformity from discrete transitions
-        // approaches 0 for optimally designed grating
-        0.02 / n.sqrt() // empirical model: improves for larger N
+    /// # Errors
+    /// - `InvalidLayer` if any distance/period is non-positive.
+    /// - `InvalidRefractiveIndex` if delta_n is negative.
+    pub fn new(
+        delta_n: f64,
+        thickness_m: f64,
+        bragg_wavelength_m: f64,
+        period_m: f64,
+        bragg_angle_rad: f64,
+    ) -> Result<Self, OxiPhotonError> {
+        if thickness_m <= 0.0 {
+            return Err(OxiPhotonError::InvalidLayer(format!(
+                "VolumeGrating thickness must be > 0, got {thickness_m} m"
+            )));
+        }
+        if period_m <= 0.0 {
+            return Err(OxiPhotonError::InvalidLayer(format!(
+                "VolumeGrating period must be > 0, got {period_m} m"
+            )));
+        }
+        if bragg_wavelength_m <= 0.0 {
+            return Err(OxiPhotonError::InvalidWavelength(bragg_wavelength_m));
+        }
+        if delta_n < 0.0 {
+            return Err(OxiPhotonError::InvalidRefractiveIndex { n: delta_n, k: 0.0 });
+        }
+        Ok(Self {
+            delta_n,
+            thickness_m,
+            bragg_wavelength_m,
+            period_m,
+            bragg_angle_rad,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Raman-Nath regime
+    // -----------------------------------------------------------------------
+
+    /// Raman-Nath phase modulation strength ν = 2π·Δn·d / λ.
+    ///
+    /// This is the argument to J_m in the Raman-Nath diffraction formula.
+    pub fn raman_nath_modulation(&self, wavelength_m: f64) -> f64 {
+        2.0 * PI * self.delta_n * self.thickness_m / wavelength_m
+    }
+
+    /// Raman-Nath diffraction order spectrum.
+    ///
+    /// Returns `(order, efficiency)` pairs for m ∈ {-m_max, ..., m_max}
+    /// where efficiency η_m = J_m²(ν) and ν = 2π·Δn·d / λ.
+    ///
+    /// Uses Miller's downward recurrence (A&S 9.1.27) for numerical stability.
+    pub fn diffraction_orders(&self, m_max: usize, wavelength_m: f64) -> Vec<(i32, f64)> {
+        let nu = self.raman_nath_modulation(wavelength_m);
+        let j_vals = bessel_j_integer(m_max, nu);
+        let mut orders = Vec::with_capacity(2 * m_max + 1);
+        for m in 0..=m_max as i32 {
+            let eta = j_vals[m as usize].powi(2);
+            if m == 0 {
+                orders.push((0, eta));
+            } else {
+                orders.push((m, eta));
+                // J_{-m}(x) = (-1)^m J_m(x), so J_{-m}² = J_m²
+                orders.push((-m, eta));
+            }
+        }
+        orders
+    }
+
+    /// First-order (m=1) diffraction efficiency in the thin (Raman-Nath) regime.
+    ///
+    /// Computes η₁ = J₁²(ν) exactly via Miller's downward recurrence.
+    ///
+    /// This supersedes the former approximate formula η₁ ≈ ν²/4 (valid only for ν ≪ 1).
+    pub fn first_order_efficiency_thin(&self, wavelength_m: f64) -> f64 {
+        let nu = self.raman_nath_modulation(wavelength_m);
+        let j_vals = bessel_j_integer(1, nu);
+        // j_vals[1] = J₁(ν); efficiency = J₁²(ν)
+        j_vals[1].powi(2)
+    }
+
+    // -----------------------------------------------------------------------
+    // Kogelnik thick-grating regime
+    // -----------------------------------------------------------------------
+
+    /// Kogelnik coupling constant κ = π·Δn / λ_B.
+    ///
+    /// At Bragg resonance, R(λ_B) = tanh²(κ·d).
+    fn coupling_constant(&self) -> f64 {
+        PI * self.delta_n / self.bragg_wavelength_m
+    }
+
+    /// Linear off-Bragg detuning parameter δ(λ).
+    ///
+    /// Derived from the on-Bragg condition λ_B = 2·Λ_g·cos θ_B:
+    ///   δ(λ) = (π·cos θ_B / (Λ_g·λ)) · (λ − λ_B)  × correction factor
+    ///
+    /// Standard Kogelnik linearisation (first order in Δλ = λ − λ_B):
+    ///   δ ≈ (2π·n·cos θ_B / λ_B²) · (λ_B − λ)
+    ///     = −(2π·n·cos θ_B / λ_B²) · (λ − λ_B)
+    ///
+    /// Canonical Kogelnik 1969 detuning for a reflection-grating, derived from
+    /// the Bragg condition λ_B = 2·n·Λ_g·cos θ_B, which lets us eliminate n:
+    ///
+    ///   δ = π·(λ_B − λ) / (λ_B · Λ_g)
+    ///
+    /// This is the per-unit-length detuning (m⁻¹); ξ = δ·d is used in the formula.
+    fn detuning(&self, wavelength_m: f64) -> f64 {
+        // Kogelnik 1969 reflection-grating detuning, derived from Bragg condition
+        // λ_B = 2·n·Λ_g·cos θ_B  →  eliminate n to get δ = π·(λ_B−λ)/(λ_B·Λ_g)
+        // Sign convention: δ > 0 when λ < λ_B (below Bragg wavelength)
+        PI * (self.bragg_wavelength_m - wavelength_m) / (self.bragg_wavelength_m * self.period_m)
+    }
+
+    /// Reflection spectrum R(λ) using Kogelnik 1969 coupled-wave theory.
+    ///
+    /// Returns diffraction efficiency in [0, 1] for a reflection-mode volume hologram.
+    ///
+    /// Kogelnik's canonical result (eq. 4.19) with:
+    ///   ν = κ·d  (normalised coupling),  ξ = δ·d  (normalised detuning)
+    ///
+    /// Branch A (ν² ≥ ξ²) — over-coupled / near Bragg:
+    ///   Γ = √(ν² − ξ²)
+    ///   η = sinh²(Γ) / (cosh²(Γ) − ξ²/ν²)
+    ///
+    /// Branch B (ξ² > ν²) — off-Bragg / under-coupled:
+    ///   Φ = √(ξ² − ν²)
+    ///   η = sin²(Φ) / (sin²(Φ) + ξ²/ν² − 1)
+    ///
+    /// Both branches reduce to tanh²(ν) at ξ = 0, and agree at the branch
+    /// boundary ξ = ν where both give ν²/(1 + ν²) [using L'Hôpital].
+    pub fn reflection_spectrum(&self, wavelength_m: f64) -> f64 {
+        let kappa = self.coupling_constant();
+        let d = self.thickness_m;
+        let delta = self.detuning(wavelength_m);
+
+        let nu = kappa * d; // normalised coupling ν = κ·d
+        let xi = delta * d; // normalised detuning ξ = δ·d
+
+        // Guard: κ = 0 means no hologram recorded
+        if nu.abs() < 1e-30 {
+            return 0.0;
+        }
+
+        let nu2 = nu * nu;
+        let xi2 = xi * xi;
+        let ratio2 = xi2 / nu2; // (ξ/ν)²
+
+        if nu2 >= xi2 {
+            // Branch A: Γ = √(ν² − ξ²) — near-Bragg / over-coupled
+            let gamma = (nu2 - xi2).sqrt();
+            if gamma < 1e-15 {
+                // Boundary ξ = ν: lim_{Γ→0} sinh²(Γ)/(cosh²(Γ) − ratio²)
+                // ≈ Γ² / (1 + Γ² − ratio²) → ν²/(1 + ν² − ν²) = ν²
+                // More precisely at ξ=ν: η = tanh²(ν) / (1 − ratio²·sech²(ν) + ...)
+                // Use numerically safe tanh² at exact Bragg
+                return nu.tanh().powi(2);
+            }
+            let sh = gamma.sinh();
+            let ch = gamma.cosh();
+            let numerator = sh * sh;
+            let denominator = ch * ch - ratio2;
+            if denominator < 1e-15 {
+                // Shouldn't occur for valid κ,δ — defensive clamp
+                return 1.0_f64.min(numerator / 1e-15);
+            }
+            (numerator / denominator).clamp(0.0, 1.0)
+        } else {
+            // Branch B: Φ = √(ξ² − ν²) — off-Bragg / under-coupled
+            let phi = (xi2 - nu2).sqrt();
+            let sn = phi.sin();
+            let numerator = sn * sn;
+            // denominator = sin²(Φ) + ξ²/ν² − 1
+            let denominator = numerator + ratio2 - 1.0;
+            if denominator.abs() < 1e-15 {
+                // Only occurs if sin²(Φ) ≈ 1 − ξ²/ν²; clamp to near-zero
+                return 0.0;
+            }
+            if denominator <= 0.0 {
+                // Numerical artefact near the branch boundary — return 0
+                return 0.0;
+            }
+            (numerator / denominator).clamp(0.0, 1.0)
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/// Bessel functions J₀(x), J₁(x), …, J_m_max(x) via Miller's downward recurrence.
+///
+/// Algorithm (Abramowitz & Stegun 9.1.27):
+/// 1. Start at order M = m_max + max(3·|x|, 30) + 20 with seed f[M-1]=1, f[M]=0.
+/// 2. Downward recurrence: f[m-1] = (2m/x)·f[m] − f[m+1].
+/// 3. Normalise using Bessel completeness: Σ_{m=-∞}^{∞} J_m²(x) = 1,
+///    equivalently  f[0]² + 2·Σ_{m=1}^{M} f[m]² = norm².
+///
+/// Edge cases: x ≈ 0 → J₀=1, J_m=0 for m≥1.
+fn bessel_j_integer(m_max: usize, x: f64) -> Vec<f64> {
+    if x.abs() < 1e-15 {
+        let mut result = vec![0.0f64; m_max + 1];
+        result[0] = 1.0;
+        return result;
+    }
+
+    // Choose starting order M large enough for convergence.
+    let m_extra = (x.abs() as usize).saturating_mul(3).max(30) + 20;
+    let m_start = m_max + m_extra;
+
+    // Allocate recurrence array with two guard slots beyond m_start.
+    let mut f = vec![0.0f64; m_start + 2];
+    // Seed: f[m_start] = 0, f[m_start-1] = 1 (unnormalised).
+    f[m_start - 1] = 1.0;
+
+    // Downward recurrence: f[m-1] = (2m/x)·f[m] − f[m+1]
+    for m in (1..=m_start - 1).rev() {
+        f[m - 1] = 2.0 * m as f64 / x * f[m] - f[m + 1];
+        // Renormalise on overflow to prevent floating-point overflow.
+        if f[m - 1].abs() > 1e150 {
+            let scale = 1.0 / f[m - 1].abs();
+            for fi in f.iter_mut() {
+                *fi *= scale;
+            }
+        }
+    }
+
+    // Normalise using the Bessel completeness relation:
+    //   J₀²(x) + 2·Σ_{m=1}^{∞} J_m²(x) = 1
+    let sum_sq: f64 = f[0].powi(2) + 2.0 * f[1..=m_start].iter().map(|v| v.powi(2)).sum::<f64>();
+    let norm = sum_sq.sqrt();
+
+    if norm < 1e-300 {
+        // Degenerate: return J₀=1 fallback
+        let mut result = vec![0.0f64; m_max + 1];
+        result[0] = 1.0;
+        return result;
+    }
+
+    f[..=m_max].iter().map(|v| v / norm).collect()
+}
 
 /// sinc²(x) = (sin(πx)/(πx))², with sinc(0) = 1.
 fn sinc_sq(x: f64) -> f64 {

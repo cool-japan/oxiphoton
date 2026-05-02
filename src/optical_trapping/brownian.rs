@@ -284,7 +284,7 @@ impl LangevinSimulator {
             return 0.0;
         }
         // Use last 10% of MSD values as long-lag plateau (for free diffusion: MSD=6Dt)
-        let start = (msd.len() * 9 / 10).max(0);
+        let start = msd.len() * 9 / 10;
         let tail = &msd[start..];
         if tail.is_empty() {
             return 0.0;

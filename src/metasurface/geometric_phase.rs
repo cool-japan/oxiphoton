@@ -15,6 +15,7 @@
 /// operation and allows encoding two independent phase profiles in the same
 /// aperture (spin-multiplexing).
 use num_complex::Complex64;
+use oxifft::Complex as OxiComplex;
 use std::f64::consts::PI;
 
 // ---------------------------------------------------------------------------
@@ -290,11 +291,22 @@ pub enum MetasurfaceFunction {
         /// Deflection angle (degrees)
         angle_deg: f64,
     },
-    /// Hologram (described by a target image string; actual phase is computed
-    /// offline and stored in the orientation map).
+    /// Holographic beam shaping — implements the target phase via precomputed
+    /// Pancharatnam-Berry phase encoding.
+    ///
+    /// The `phase_map[iy][ix]` grid contains the pupil-plane phase φ(x,y) in
+    /// radians. `orientation_at` returns φ/2 (the nanofin rotation angle) so
+    /// that 2θ = φ.
     Hologram {
-        /// Human-readable description of the target image
-        target_image_description: String,
+        /// Precomputed phase map φ(x, y) in radians, indexed `[iy][ix]`.
+        /// Row 0, column 0 maps to world coordinate `origin`.
+        phase_map: std::sync::Arc<Vec<Vec<f64>>>,
+        /// World coordinate (m) of `phase_map[0][0]` — i.e. the corner pixel.
+        origin: (f64, f64),
+        /// Pixel pitch Δ (m) — uniform in x and y.
+        pitch: f64,
+        /// Optional human-readable label.
+        label: String,
     },
     /// Optical vortex beam generator.
     Vortex {
@@ -318,15 +330,165 @@ impl MetasurfaceFunction {
                 let s = x * dir.cos() + y * dir.sin();
                 PI * s / period
             }
-            MetasurfaceFunction::Hologram { .. } => {
-                // Placeholder: actual phase from Gerchberg-Saxton would be stored.
-                0.0
+            MetasurfaceFunction::Hologram {
+                phase_map,
+                origin,
+                pitch,
+                ..
+            } => {
+                if phase_map.is_empty() || phase_map[0].is_empty() {
+                    return 0.0;
+                }
+                let ny = phase_map.len();
+                let nx = phase_map[0].len();
+                // Map world coords to fractional grid indices
+                let fx = (x - origin.0) / pitch;
+                let fy = (y - origin.1) / pitch;
+                // Clamp to valid range for boundary pixels; return 0 if fully out of bounds
+                if fx < 0.0 || fy < 0.0 || fx >= nx as f64 || fy >= ny as f64 {
+                    return 0.0;
+                }
+                // Bilinear interpolation
+                let ix0 = fx.floor() as usize;
+                let iy0 = fy.floor() as usize;
+                let ix1 = (ix0 + 1).min(nx - 1);
+                let iy1 = (iy0 + 1).min(ny - 1);
+                let tx = fx - ix0 as f64;
+                let ty = fy - iy0 as f64;
+                let p00 = phase_map[iy0][ix0];
+                let p10 = phase_map[iy0][ix1];
+                let p01 = phase_map[iy1][ix0];
+                let p11 = phase_map[iy1][ix1];
+                let phase = p00 * (1.0 - tx) * (1.0 - ty)
+                    + p10 * tx * (1.0 - ty)
+                    + p01 * (1.0 - tx) * ty
+                    + p11 * tx * ty;
+                // Geometric-phase encoding: orientation angle θ = φ/2
+                phase / 2.0
             }
             MetasurfaceFunction::Vortex { charge } => {
                 let l = *charge as f64;
                 (l / 2.0) * y.atan2(x)
             }
         }
+    }
+
+    /// Create a hologram from a precomputed phase map.
+    ///
+    /// # Arguments
+    /// * `phase_map` — 2-D grid of phase values in radians, indexed `[iy][ix]`.
+    ///   Must be non-empty and rectangular (all rows the same length).
+    /// * `origin` — world coordinate (m) of `phase_map[0][0]`.
+    /// * `pitch` — pixel pitch (m), must be positive.
+    /// * `label` — optional human-readable description.
+    ///
+    /// # Errors
+    /// Returns `Err` if `phase_map` is empty, non-rectangular, or `pitch <= 0`.
+    pub fn hologram_from_phase_map(
+        phase_map: Vec<Vec<f64>>,
+        origin: (f64, f64),
+        pitch: f64,
+        label: impl Into<String>,
+    ) -> Result<Self, String> {
+        if phase_map.is_empty() {
+            return Err("phase_map must not be empty".into());
+        }
+        if pitch <= 0.0 {
+            return Err(format!("pitch must be positive, got {pitch}"));
+        }
+        let ncols = phase_map[0].len();
+        if ncols == 0 {
+            return Err("phase_map rows must not be empty".into());
+        }
+        if phase_map.iter().any(|row| row.len() != ncols) {
+            return Err("phase_map must be rectangular (all rows same length)".into());
+        }
+        Ok(MetasurfaceFunction::Hologram {
+            phase_map: std::sync::Arc::new(phase_map),
+            origin,
+            pitch,
+            label: label.into(),
+        })
+    }
+
+    /// Compute a hologram phase map from a target intensity image using the
+    /// Gerchberg-Saxton iterative Fourier algorithm.
+    ///
+    /// # Arguments
+    /// * `target` — 2-D target intensity pattern (ny × nx), non-negative values.
+    /// * `pitch` — pixel pitch in m.
+    /// * `n_iters` — number of GS iterations (50–200 is typical).
+    /// * `label` — human-readable description.
+    ///
+    /// Returns a `Hologram` with the recovered pupil-plane phase, with `origin`
+    /// at `(0.0, 0.0)`.
+    ///
+    /// # Errors
+    /// Returns `Err` if `target` is empty, non-rectangular, or `pitch <= 0`.
+    pub fn hologram_from_target(
+        target: &[Vec<f64>],
+        pitch: f64,
+        n_iters: usize,
+        label: impl Into<String>,
+    ) -> Result<Self, String> {
+        if target.is_empty() || target[0].is_empty() {
+            return Err("target must be non-empty".into());
+        }
+        if pitch <= 0.0 {
+            return Err(format!("pitch must be positive, got {pitch}"));
+        }
+        let ny = target.len();
+        let nx = target[0].len();
+        if target.iter().any(|row| row.len() != nx) {
+            return Err("target must be rectangular".into());
+        }
+
+        // Build target amplitude from target intensity (sqrt for amplitude).
+        let target_amp: Vec<Vec<f64>> = target
+            .iter()
+            .map(|row| row.iter().map(|&v| v.max(0.0).sqrt()).collect())
+            .collect();
+
+        // Initialize pupil field (flat, row-major) with deterministic pseudo-random
+        // phase using a diagonal wave pattern, unit amplitude.
+        let n_total = ny * nx;
+        let mut pupil: Vec<OxiComplex<f64>> = (0..n_total)
+            .map(|k| {
+                let phase = PI * (k as f64) / (n_total as f64);
+                OxiComplex::from_polar(1.0_f64, phase)
+            })
+            .collect();
+
+        // Gerchberg-Saxton iterations.
+        for _ in 0..n_iters {
+            // 1. Forward 2D FFT: pupil plane → image plane.
+            let mut image = oxifft::fft2d(&pupil, ny, nx);
+
+            // 2. Replace image-plane amplitude with target, keep phase.
+            for (iy, row) in target_amp.iter().enumerate() {
+                for (ix, &amp_t) in row.iter().enumerate() {
+                    let c = image[iy * nx + ix];
+                    let ph = c.arg();
+                    image[iy * nx + ix] = OxiComplex::from_polar(amp_t, ph);
+                }
+            }
+
+            // 3. Inverse 2D FFT: image plane → pupil plane.
+            let back = oxifft::ifft2d(&image, ny, nx);
+
+            // 4. Replace pupil-plane amplitude with 1.0, keep phase.
+            for (k, c) in back.iter().enumerate() {
+                let ph = c.arg();
+                pupil[k] = OxiComplex::from_polar(1.0_f64, ph);
+            }
+        }
+
+        // Extract pupil-plane phase as 2-D grid.
+        let phase_map: Vec<Vec<f64>> = (0..ny)
+            .map(|iy| (0..nx).map(|ix| pupil[iy * nx + ix].arg()).collect())
+            .collect();
+
+        Self::hologram_from_phase_map(phase_map, (0.0, 0.0), pitch, label)
     }
 }
 
@@ -494,5 +656,63 @@ mod tests {
             (phi_lcp - phi_rcp).abs() > 1e-6,
             "LCP and RCP phases are identical: phi_lcp={phi_lcp}, phi_rcp={phi_rcp}"
         );
+    }
+
+    #[test]
+    fn hologram_phase_map_interpolation() {
+        // 3×3 phase map with known values
+        let map = vec![
+            vec![0.0, PI / 4.0, PI / 2.0],
+            vec![PI, PI, PI],
+            vec![3.0 * PI / 2.0, 7.0 * PI / 4.0, 2.0 * PI],
+        ];
+        let func = MetasurfaceFunction::hologram_from_phase_map(map, (0.0, 0.0), 1.0e-6, "test")
+            .expect("valid hologram");
+        // At grid centre (1, 1) in pixel coords → world (1e-6, 1e-6)
+        let theta = func.orientation_at(1.0e-6, 1.0e-6, 1550e-9);
+        let expected = PI / 2.0; // phase_map[1][1] = PI, orientation = PI/2
+        assert!(
+            (theta - expected).abs() < 1e-12,
+            "got {theta}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn hologram_from_phase_map_errors() {
+        // Empty map
+        assert!(
+            MetasurfaceFunction::hologram_from_phase_map(vec![], (0.0, 0.0), 1e-6, "").is_err()
+        );
+        // Non-positive pitch
+        assert!(
+            MetasurfaceFunction::hologram_from_phase_map(vec![vec![0.0]], (0.0, 0.0), 0.0, "")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hologram_from_target_gs_convergence() {
+        // Small 8×8 target: bright spot at (2, 2)
+        let mut target = vec![vec![0.0f64; 8]; 8];
+        target[2][2] = 1.0;
+        let hologram = MetasurfaceFunction::hologram_from_target(&target, 1.0e-6, 50, "gs_test")
+            .expect("GS should succeed");
+        // Verify it's a Hologram variant and phase_map is 8×8
+        match &hologram {
+            MetasurfaceFunction::Hologram { phase_map, .. } => {
+                assert_eq!(phase_map.len(), 8);
+                assert_eq!(phase_map[0].len(), 8);
+                // All phases should be in [-π, π]
+                for row in phase_map.iter() {
+                    for &phase in row.iter() {
+                        assert!(
+                            (-PI - 1e-10..=PI + 1e-10).contains(&phase),
+                            "phase {phase} out of range"
+                        );
+                    }
+                }
+            }
+            _ => panic!("expected Hologram variant"),
+        }
     }
 }

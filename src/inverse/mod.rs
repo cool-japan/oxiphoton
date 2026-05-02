@@ -10,15 +10,20 @@
 //! This enables gradient-based optimization of complex photonic structures
 //! using algorithms like L-BFGS or Adam.
 pub mod adjoint;
+pub mod adjoint_3d;
 pub mod fabrication;
 pub mod parametric;
 pub mod shape;
 pub mod topology;
 
-pub use adjoint::{AdjointSolver, DesignRegion, FomGradient};
+pub use adjoint::{AdjointOptimizer, AdjointSolver, AdjointSolver2d, DesignRegion, FomGradient};
+pub use adjoint_3d::{
+    AdjointSolver3d, DesignRegion3d, DesignVariable, FdtdSourceConfig, PortPlane, VectorField3d,
+    VectorSourcePattern,
+};
 pub use fabrication::{CurvaturePenalty, FabricationConstraints};
 pub use parametric::{
     ConvergenceHistory, MomentumGD, MultiStart, NelderMead, ParametricProblem, Pso,
 };
 pub use shape::{LevelSet, ParametricShape};
-pub use topology::{BinaryProjection, TopologyOptimizer};
+pub use topology::{continuation_schedule, BinaryProjection, Pseudo2dFom, TopologyOptimizer};

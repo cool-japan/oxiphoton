@@ -1,3 +1,10 @@
+//! # OxiPhoton
+//!
+//! Pure Rust Computational Photonics & Optical Simulation Framework.
+//!
+//! Provides FDTD, S-matrix, BPM, RCWA, and mode-solver engines for simulating
+//! photonic devices, solar cells, fibers, and silicon photonic circuits.
+
 pub mod biophotonics;
 pub mod coherence;
 pub mod detector;

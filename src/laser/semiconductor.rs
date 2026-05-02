@@ -314,39 +314,13 @@ impl SemiconductorLaser {
     // Small-signal dynamics
     // -----------------------------------------------------------------------
 
-    /// Steady-state photon density S_ss (m⁻³) at a given current.
-    #[allow(dead_code)]
-    fn steady_state_photon_density(&self, current_ma: f64, injection_efficiency: f64) -> f64 {
-        let i_th = self.threshold_current_ma();
-        if current_ma <= i_th {
-            return 0.0;
-        }
-        let eta_inj = injection_efficiency.clamp(0.0, 1.0);
-        let i_a = current_ma * 1.0e-3; // mA → A
-        let i_th_a = i_th * 1.0e-3;
-        let v_act = self.active_volume_m3();
-        let tau_n = self.carrier_lifetime_ns * 1.0e-9;
-        let tau_p = self.photon_lifetime_s();
-        // From rate equations in steady state:
-        // S_ss = Γ · τ_p · η_inj · (I - I_th) / (e · V)
-        self.confinement_factor * tau_p * eta_inj * (i_a - i_th_a)
-            / (E_CHARGE * v_act * tau_n / tau_n)
-        // Simplification: S_ss ≈ Γ·τ_p·(I - I_th)/(e·V)
-        // (using the fact that N ≈ N_th above threshold)
-        // Re-derive more carefully:
-        // Above threshold N ≈ N_th (clamped), so
-        // dN/dt = 0 → J/(e·d) - N_th/τ_n = v_g·g_th·S  ← stimulated
-        // But the photon rate equation:
-        // S_ss = Γ·β·N_th/τ_n·τ_p  + Γ·v_g·g_th·S·τ_p  (self-consistent)
-        // Above threshold (N clamped at N_th): the excess current feeds photons
-        // ΔJ = (I - I_th)/(e·d·A) = v_g·g_th·S/Γ  (simplified)
-        // So S_ss = Γ·τ_p·ΔJ·d·A/(e) ... this needs rework.
-        // We handle it properly below; the line above is a placeholder.
-    }
-
-    /// Properly-computed steady-state photon density.
-    #[allow(dead_code)]
-    fn photon_density_ss(&self, current_ma: f64, injection_efficiency: f64) -> f64 {
+    /// Steady-state photon density S_ss (m⁻³) at a given injection current.
+    ///
+    /// Above threshold, the excess carrier injection converts to photons:
+    /// S_ss = Γ · η_inj · (I − I_th) · τ_p / (e · V)
+    ///
+    /// Returns 0 below threshold.
+    pub fn photon_density_ss(&self, current_ma: f64, injection_efficiency: f64) -> f64 {
         let i_th = self.threshold_current_ma();
         if current_ma <= i_th {
             return 0.0;
@@ -976,5 +950,18 @@ mod tests {
             alpha_m > 0.0,
             "mirror loss must be positive: {alpha_m:.4e} m⁻¹"
         );
+    }
+
+    #[test]
+    fn photon_density_ss_above_threshold() {
+        let laser = ingaasp();
+        let ith = laser.threshold_current_ma();
+        let s = laser.photon_density_ss(ith * 2.0, 0.8);
+        assert!(
+            s > 0.0,
+            "photon density should be positive above threshold, got {s}"
+        );
+        let s_below = laser.photon_density_ss(ith * 0.5, 0.8);
+        assert_eq!(s_below, 0.0, "photon density should be 0 below threshold");
     }
 }

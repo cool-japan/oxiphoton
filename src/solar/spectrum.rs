@@ -2,10 +2,13 @@
 //!
 //! Includes:
 //! - `AM15G_DATA` — tabulated AM1.5G irradiance (W/m²/nm)
+//! - `AM0_E490_DATA` — ASTM E490-00a / Wehrli 1985 extraterrestrial spectrum (W/m²/nm)
 //! - `SolarSpectrum` — interpolating wrapper with integration helpers
 //! - Blackbody / Planck spectrum tools
 //! - Shockley-Queisser efficiency limit
 //! - Concentration-ratio effects on open-circuit voltage
+
+use super::am0_e490_data::AM0_E490_DATA;
 
 const PLANCK_H: f64 = 6.626_070_15e-34; // J·s
 const BOLTZMANN: f64 = 1.380_649e-23; // J/K
@@ -124,6 +127,46 @@ impl SolarSpectrum {
             wavelengths,
             irradiances,
         }
+    }
+
+    /// Air Mass Zero (AM0) — extraterrestrial solar spectrum at 1 AU.
+    ///
+    /// Uses the ASTM E490-00a / Wehrli 1985 WRC-615 spectral table linearly
+    /// interpolated onto the same wavelength grid as `am15g()`, then
+    /// normalised so `am0().total_irradiance() ≈ 1366.0 W/m²`.
+    ///
+    /// The E490 table covers 119.5–1,000,000 nm (1697 points). Its raw
+    /// trapezoidal integral ≈ 1366.09 W/m² (Wehrli solar constant).
+    /// Interpolating onto the coarser AM15G grid reduces that to ≈ 1353 W/m²;
+    /// self-normalisation corrects to exactly 1366.0 W/m².
+    pub fn am0() -> Self {
+        const SOLAR_CONSTANT_W_M2: f64 = 1366.0;
+
+        // Use the same wavelength grid as AM15G for downstream integrator compatibility.
+        // AM0_E490_DATA stores (wavelength_nm, irradiance_W_m2_nm).
+        let wavelengths: Vec<f64> = AM15G_DATA.iter().map(|&(wl_nm, _)| wl_nm * 1e-9).collect();
+
+        // Interpolate E490 irradiance onto each AM15G wavelength.
+        // Store in W/m²/m (multiply W/m²/nm × 1e9).
+        let raw_irradiances: Vec<f64> = AM15G_DATA
+            .iter()
+            .map(|&(wl_nm, _)| {
+                let irr_per_nm = interp_e490(wl_nm);
+                irr_per_nm * 1.0e9 // W/m²/nm → W/m²/m
+            })
+            .collect();
+
+        // Normalise to the ASTM E490 solar constant.
+        let mut spec = Self {
+            wavelengths,
+            irradiances: raw_irradiances,
+        };
+        let raw_total = spec.total_irradiance();
+        let scale = SOLAR_CONSTANT_W_M2 / raw_total;
+        for v in &mut spec.irradiances {
+            *v *= scale;
+        }
+        spec
     }
 
     /// Create from custom (wavelength_m, irradiance_W_m2_m) pairs.
@@ -255,6 +298,33 @@ pub fn integrate_photon_flux(spectrum: &[(f64, f64)], lambda_min: f64, lambda_ma
         sum += 0.5 * (phi_a + phi_b) * (lb - la);
     }
     sum
+}
+
+// ─── E490 interpolation helper ────────────────────────────────────────────────
+
+/// Linear interpolation of ASTM E490-00a spectral irradiance at `wl_nm` (nm).
+///
+/// Returns irradiance in W/m²/nm. Clamps to edge values outside the tabulated
+/// range (119.5–1,000,000 nm).
+fn interp_e490(wl_nm: f64) -> f64 {
+    let n = AM0_E490_DATA.len();
+    if n == 0 {
+        return 0.0;
+    }
+    // Edge clamping
+    if wl_nm <= AM0_E490_DATA[0].0 {
+        return AM0_E490_DATA[0].1;
+    }
+    if wl_nm >= AM0_E490_DATA[n - 1].0 {
+        return AM0_E490_DATA[n - 1].1;
+    }
+    // Binary search for the bracketing interval
+    let idx = AM0_E490_DATA.partition_point(|&(w, _)| w <= wl_nm);
+    let i = idx - 1;
+    let (w0, e0) = AM0_E490_DATA[i];
+    let (w1, e1) = AM0_E490_DATA[idx];
+    let t = (wl_nm - w0) / (w1 - w0);
+    e0 + t * (e1 - e0)
 }
 
 // ─── Blackbody spectrum ───────────────────────────────────────────────────────

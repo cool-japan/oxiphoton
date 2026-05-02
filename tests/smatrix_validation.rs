@@ -102,8 +102,8 @@ fn eme_energy_conservation_bound() {
     solver.add_segment(EmeSegment::new(5e-6, 3.476, 1.444, 500e-9));
     solver.add_segment(EmeSegment::new(5e-6, 3.476, 1.444, 800e-9));
     let s = solver.solve_fundamental();
-    let t = s.s21 * s.s21;
-    let r = s.s11 * s.s11;
+    let t = s.s21.norm_sqr();
+    let r = s.s11.norm_sqr();
     assert!(t + r <= 1.0 + 1e-10, "T+R={} > 1", t + r);
 }
 
@@ -121,21 +121,21 @@ fn smatrix_cascade_identical_sections() {
 #[test]
 fn smatrix_2x2_cascade_identity_left() {
     let s = SMatrix2x2 {
-        s11: 0.1,
-        s12: 0.9,
-        s21: 0.9,
-        s22: 0.1,
+        s11: Complex64::new(0.1, 0.0),
+        s12: Complex64::new(0.9, 0.0),
+        s21: Complex64::new(0.9, 0.0),
+        s22: Complex64::new(0.1, 0.0),
     };
     let id = SMatrix2x2::identity();
     let result = id.cascade(&s);
     assert!(
-        (result.s11 - s.s11).abs() < 1e-10,
+        (result.s11 - s.s11).norm() < 1e-10,
         "S11: {} vs {}",
         result.s11,
         s.s11
     );
     assert!(
-        (result.s21 - s.s21).abs() < 1e-10,
+        (result.s21 - s.s21).norm() < 1e-10,
         "S21: {} vs {}",
         result.s21,
         s.s21
@@ -148,7 +148,7 @@ fn smatrix_cascade_interface_reduces_transmission() {
     let s_lossless = SMatrix2x2::identity();
     let s_partial = SMatrix2x2::from_overlap(0.7); // 70% overlap
     let combined = s_lossless.cascade(&s_partial);
-    let t = combined.s21 * combined.s21;
+    let t = combined.s21.norm_sqr();
     assert!(t < 1.0, "Combined transmission={t} should be < 1");
     assert!(t > 0.0, "Combined transmission={t} should be > 0");
 }

@@ -7,7 +7,7 @@
 //! - Reck et al. (1994) triangular MZI decomposition
 //! - Clements et al. (2016) rectangular MZI mesh
 //! - Permanent and hafnian of complex matrices
-//! - KLM CNOT gate stub (success probability bookkeeping)
+//! - KLM CNOT gate with success-probability bookkeeping and Knill-scaling ancilla boost
 
 use num_complex::Complex64;
 use std::f64::consts::PI;

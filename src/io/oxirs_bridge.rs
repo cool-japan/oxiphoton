@@ -10,7 +10,8 @@
 //! Predicates are photonic properties (wavelength, n_eff, transmission, etc.).
 //! Objects are typed literals (numeric, string, unit-annotated).
 //!
-//! This module provides stub structures for future full oxirs integration.
+//! Real HTTP connectivity to a SPARQL endpoint is provided by [`OxirsConnection`],
+//! which is available when the `io-oxirs` feature flag is enabled.
 
 use std::fmt;
 
@@ -226,17 +227,29 @@ impl PhotonicSimExporter {
     }
 }
 
-/// oxirs connection stub (placeholder for future real oxirs API integration).
+/// Real SPARQL-over-HTTP connection to an oxirs-fuseki or compatible endpoint.
+///
+/// Requires the `io-oxirs` feature flag.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// # #[cfg(feature = "io-oxirs")]
+/// let conn = OxirsConnection::new("http://localhost:3030/dataset/sparql");
+/// let rows = conn.query("SELECT * WHERE { ?s ?p ?o } LIMIT 10")?;
+/// ```
+#[cfg(feature = "io-oxirs")]
 #[derive(Debug, Clone)]
 pub struct OxirsConnection {
-    /// Remote endpoint URL
+    /// Remote SPARQL endpoint URL (e.g. `http://localhost:3030/dataset`).
     pub endpoint: String,
-    /// Authentication token (placeholder)
+    /// Optional Bearer authentication token.
     pub token: Option<String>,
 }
 
+#[cfg(feature = "io-oxirs")]
 impl OxirsConnection {
-    /// Create connection to a SPARQL-compatible endpoint.
+    /// Create a connection to a SPARQL-compatible endpoint.
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -244,25 +257,105 @@ impl OxirsConnection {
         }
     }
 
-    /// Set authentication token.
+    /// Attach a Bearer authentication token to all requests from this connection.
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
     }
 
-    /// Simulate uploading triples (stub — returns byte count).
+    /// Upload a knowledge graph as N-Triples to the SPARQL endpoint.
+    ///
+    /// Sends a POST request with `Content-Type: application/n-triples`.
+    /// Returns the number of bytes sent on success.
     pub fn upload_graph(&self, graph: &KnowledgeGraph) -> Result<usize, String> {
         let data = graph.to_n_triples();
-        // In a real implementation, this would POST to `self.endpoint`
-        // For now, return the number of bytes that would be sent
-        Ok(data.len())
+        let byte_count = data.len();
+
+        let mut req = ureq::post(&self.endpoint).header("Content-Type", "application/n-triples");
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        req.send(data.as_bytes())
+            .map_err(|e| format!("upload_graph HTTP error: {e}"))?;
+
+        Ok(byte_count)
     }
 
-    /// Simulate a SPARQL SELECT query (stub — returns empty results).
-    pub fn query(&self, _sparql: &str) -> Result<Vec<Vec<String>>, String> {
-        // Stub: real implementation would HTTP GET to endpoint
-        Ok(Vec::new())
+    /// Execute a SPARQL SELECT query against the endpoint.
+    ///
+    /// Sends a GET request with the query URL-encoded as `?query=...`
+    /// and `Accept: application/sparql-results+json`.
+    ///
+    /// Returns a list of result rows; each row is a list of binding values
+    /// (one per variable, in the order returned by the endpoint).
+    pub fn query(&self, sparql: &str) -> Result<Vec<Vec<String>>, String> {
+        let mut req = ureq::get(&self.endpoint)
+            .query("query", sparql)
+            .header("Accept", "application/sparql-results+json");
+
+        if let Some(token) = &self.token {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let body = req
+            .call()
+            .map_err(|e| format!("query HTTP error: {e}"))?
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("query read error: {e}"))?;
+
+        parse_sparql_json(&body)
     }
+}
+
+/// Parse a SPARQL 1.1 Query Results JSON Format response body.
+///
+/// Expects the standard structure:
+/// ```json
+/// {"head":{"vars":["v1","v2"]},"results":{"bindings":[{"v1":{"type":"literal","value":"x"}}]}}
+/// ```
+///
+/// Returns one `Vec<String>` per result row, with values ordered by the
+/// variable list in `head.vars`. Missing bindings in a row produce an empty string.
+#[cfg(feature = "io-oxirs")]
+fn parse_sparql_json(body: &str) -> Result<Vec<Vec<String>>, String> {
+    use serde_json::Value;
+
+    let json: Value =
+        serde_json::from_str(body).map_err(|e| format!("query JSON parse error: {e}"))?;
+
+    let vars: Vec<&str> = json
+        .get("head")
+        .and_then(|h| h.get("vars"))
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let bindings = json
+        .get("results")
+        .and_then(|r| r.get("bindings"))
+        .and_then(|b| b.as_array())
+        .ok_or_else(|| "query: unexpected SPARQL JSON structure".to_string())?;
+
+    let rows: Vec<Vec<String>> = bindings
+        .iter()
+        .map(|binding| {
+            vars.iter()
+                .map(|var| {
+                    binding
+                        .get(var)
+                        .and_then(|b| b.get("value"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect()
+        })
+        .collect();
+
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -346,16 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn connection_upload_stub() {
-        let mut g = KnowledgeGraph::new("https://oxirs.io/");
-        g.add_literal("dev", "type", "Test");
-        let conn = OxirsConnection::new("https://oxirs.io/sparql");
-        let bytes = conn.upload_graph(&g);
-        assert!(bytes.is_ok());
-        assert!(bytes.unwrap() > 0);
-    }
-
-    #[test]
     fn rdf_object_display_numeric() {
         let obj = RdfObject::Numeric {
             value: 1.55e-6,
@@ -375,5 +458,80 @@ mod tests {
     fn graph_is_empty() {
         let g = KnowledgeGraph::new("https://oxirs.io/");
         assert!(g.is_empty());
+    }
+
+    // --- io-oxirs feature tests ---
+
+    #[cfg(feature = "io-oxirs")]
+    #[test]
+    fn oxirs_connection_upload_returns_error_on_unreachable() {
+        let conn = OxirsConnection::new("http://127.0.0.1:1/sparql");
+        let mut g = KnowledgeGraph::new("https://test/");
+        g.add_literal("s", "p", "o");
+        let result = conn.upload_graph(&g);
+        assert!(result.is_err(), "should fail to connect to port 1");
+    }
+
+    #[cfg(feature = "io-oxirs")]
+    #[test]
+    fn oxirs_connection_query_returns_error_on_unreachable() {
+        let conn = OxirsConnection::new("http://127.0.0.1:1/sparql");
+        let result = conn.query("SELECT * WHERE { ?s ?p ?o }");
+        assert!(result.is_err(), "should fail to connect to port 1");
+    }
+
+    #[cfg(feature = "io-oxirs")]
+    #[test]
+    fn parse_sparql_json_single_variable() {
+        let body = r#"{"head":{"vars":["name"]},"results":{"bindings":[{"name":{"type":"literal","value":"Alice"}},{"name":{"type":"literal","value":"Bob"}}]}}"#;
+        let rows = parse_sparql_json(body).expect("parse");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["Alice"]);
+        assert_eq!(rows[1], vec!["Bob"]);
+    }
+
+    #[cfg(feature = "io-oxirs")]
+    #[test]
+    fn parse_sparql_json_multiple_variables() {
+        let body = r#"{"head":{"vars":["s","p","o"]},"results":{"bindings":[{"s":{"type":"uri","value":"http://example.org/s"},"p":{"type":"uri","value":"http://example.org/p"},"o":{"type":"literal","value":"hello"}}]}}"#;
+        let rows = parse_sparql_json(body).expect("parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            vec!["http://example.org/s", "http://example.org/p", "hello"]
+        );
+    }
+
+    #[cfg(feature = "io-oxirs")]
+    #[test]
+    fn parse_sparql_json_empty_results() {
+        let body = r#"{"head":{"vars":["x"]},"results":{"bindings":[]}}"#;
+        let rows = parse_sparql_json(body).expect("parse");
+        assert!(rows.is_empty());
+    }
+
+    #[cfg(feature = "io-oxirs")]
+    #[test]
+    fn parse_sparql_json_missing_binding_yields_empty_string() {
+        // Row has ?s but not ?o — missing binding should become "".
+        let body = r#"{"head":{"vars":["s","o"]},"results":{"bindings":[{"s":{"type":"literal","value":"only_s"}}]}}"#;
+        let rows = parse_sparql_json(body).expect("parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec!["only_s", ""]);
+    }
+
+    #[cfg(feature = "io-oxirs")]
+    #[test]
+    fn parse_sparql_json_invalid_json_returns_error() {
+        let result = parse_sparql_json("not json at all");
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "io-oxirs")]
+    #[test]
+    fn parse_sparql_json_missing_results_key_returns_error() {
+        let body = r#"{"head":{"vars":["x"]}}"#;
+        let result = parse_sparql_json(body);
+        assert!(result.is_err());
     }
 }

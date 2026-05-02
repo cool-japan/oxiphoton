@@ -151,23 +151,30 @@ pub struct HigherOrderSoliton {
     pub beta2: f64,
     /// Nonlinear coefficient γ (1/(W·m)).
     pub gamma: f64,
+    /// Centre wavelength λ₀ (m). Used to initialise fission products.
+    pub wavelength_m: f64,
 }
 
 impl HigherOrderSoliton {
     /// Create a higher-order soliton with order `n`, pulse width `t0`, GVD `beta2`,
-    /// and nonlinear coefficient `gamma`.
+    /// nonlinear coefficient `gamma`, and centre wavelength `wavelength_m`.
     ///
     /// # Panics
-    /// Panics if `n` = 0, `gamma` ≤ 0, or `t0` ≤ 0.
-    pub fn new(n: u32, t0: f64, beta2: f64, gamma: f64) -> Self {
+    /// Panics if `n` = 0, `gamma` ≤ 0, `t0` ≤ 0, or `wavelength_m` ≤ 0.
+    pub fn new(n: u32, t0: f64, beta2: f64, gamma: f64, wavelength_m: f64) -> Self {
         assert!(n > 0, "HigherOrderSoliton: soliton_number must be ≥ 1");
         assert!(gamma > 0.0, "HigherOrderSoliton: gamma must be positive");
         assert!(t0 > 0.0, "HigherOrderSoliton: t0 must be positive");
+        assert!(
+            wavelength_m > 0.0,
+            "HigherOrderSoliton: wavelength_m must be positive"
+        );
         Self {
             soliton_number: n,
             t0,
             beta2,
             gamma,
+            wavelength_m,
         }
     }
 
@@ -198,15 +205,14 @@ impl HigherOrderSoliton {
     /// T_k = T₀ / (2N − 2k + 1).  The shortest, most energetic soliton
     /// is k = N; it carries the most Raman shift (Agrawal §13.4).
     ///
-    /// Each product soliton inherits the same β₂, γ, and wavelength
-    /// (1550 nm as a placeholder — the caller should refine this).
+    /// Each product soliton inherits the same β₂, γ, and center wavelength as the parent.
     pub fn fission_products(&self) -> Vec<FundamentalSoliton> {
         let n = self.soliton_number;
         (1..=n)
             .map(|k| {
                 let width_factor = 2 * n - 2 * k + 1;
                 let tk = self.t0 / width_factor as f64;
-                FundamentalSoliton::new(tk, self.beta2, self.gamma, 1550e-9)
+                FundamentalSoliton::new(tk, self.beta2, self.gamma, self.wavelength_m)
             })
             .collect()
     }
@@ -422,14 +428,14 @@ mod tests {
         let t0 = 1e-12;
         let beta2 = -20e-27;
         let gamma = 1.3e-3;
-        let hos = HigherOrderSoliton::new(n, t0, beta2, gamma);
+        let hos = HigherOrderSoliton::new(n, t0, beta2, gamma, 1550e-9);
         let expected = (n as f64).powi(2) * beta2.abs() / (gamma * t0 * t0);
         assert_abs_diff_eq!(hos.peak_power(), expected, epsilon = 1e-10);
     }
 
     #[test]
     fn higher_order_soliton_fission_distance_less_than_period() {
-        let hos = HigherOrderSoliton::new(3, 1e-12, -20e-27, 1.3e-3);
+        let hos = HigherOrderSoliton::new(3, 1e-12, -20e-27, 1.3e-3, 1550e-9);
         let z0 = hos.soliton_period();
         let lfiss = hos.fission_distance();
         // L_fiss = z₀/N < z₀ for N > 1
@@ -442,7 +448,7 @@ mod tests {
     #[test]
     fn higher_order_soliton_fission_products_count() {
         let n = 4u32;
-        let hos = HigherOrderSoliton::new(n, 1e-12, -20e-27, 1.3e-3);
+        let hos = HigherOrderSoliton::new(n, 1e-12, -20e-27, 1.3e-3, 1550e-9);
         let products = hos.fission_products();
         assert_eq!(
             products.len(),
@@ -454,11 +460,27 @@ mod tests {
     #[test]
     fn higher_order_soliton_products_ordered_by_width() {
         // Product solitons: T_k = T₀/(2N-2k+1).  Widths increase with k.
-        let hos = HigherOrderSoliton::new(3, 1e-12, -20e-27, 1.3e-3);
+        let hos = HigherOrderSoliton::new(3, 1e-12, -20e-27, 1.3e-3, 1550e-9);
         let products = hos.fission_products();
         // k=1 → T₀/5; k=2 → T₀/3; k=3 → T₀/1
         assert!(products[0].pulse_width < products[1].pulse_width);
         assert!(products[1].pulse_width < products[2].pulse_width);
+    }
+
+    #[test]
+    fn fission_products_inherit_wavelength() {
+        // Create a 3rd-order soliton at 1310 nm
+        let soliton = HigherOrderSoliton::new(3, 100e-15, -20e-27, 1.3e-3, 1310e-9);
+        let products = soliton.fission_products();
+        assert_eq!(products.len(), 3);
+        for p in &products {
+            // Each product should inherit the parent wavelength
+            assert!(
+                (p.wavelength - 1310e-9).abs() < 1e-15,
+                "product wavelength should be 1310 nm, got {}",
+                p.wavelength
+            );
+        }
     }
 
     // ── SolitonTrap ──────────────────────────────────────────────────────────

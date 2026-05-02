@@ -12,22 +12,22 @@
 
 **oxiphoton** is a full-stack photonics simulation library written entirely in Rust. It provides production-grade implementations of the core algorithms used in modern photonic design and research: Finite-Difference Time-Domain (FDTD) in 2D and 3D, the Beam Propagation Method (BPM), Transfer Matrix / S-matrix methods, Rigorous Coupled-Wave Analysis (RCWA), finite-difference and FEM mode solvers, and geometric ray tracing — alongside a rich material database, type-safe unit system, and device library for silicon photonics.
 
-The library is organized into 73 public modules spanning over 446 Rust source files (~124 K lines of implementation). It is part of the COOLJAPAN ecosystem and depends only on pure-Rust crates: linear algebra via **oxiblas**, FFT via **oxifft**, and standard scientific helpers. There are no C, Fortran, or unsafe-heavy native bindings in the default build.
+The library is organized into 63 public modules spanning over 503 Rust source files (~141 K lines of implementation). It is part of the COOLJAPAN ecosystem and depends only on pure-Rust crates: linear algebra via **oxiblas**, FFT via **oxifft**, and standard scientific helpers. There are no C, Fortran, or unsafe-heavy native bindings in the default build.
 
-With 3,908 passing tests and 11 runnable examples, oxiphoton is designed for correctness and ergonomics. The API is strongly typed throughout — wavelengths, frequencies, refractive indices, field components, and geometric quantities are all distinct types with compile-time unit safety and automatic conversions.
+With 4,264 passing tests and 11 runnable examples, oxiphoton is designed for correctness and ergonomics. The API is strongly typed throughout — wavelengths, frequencies, refractive indices, field components, and geometric quantities are all distinct types with compile-time unit safety and automatic conversions.
 
-## Status (v0.1.0 — 2026-03-09)
+## Status (v0.1.1 — 2026-05-03)
 
 | Metric | Value |
 |--------|-------|
-| Version | 0.1.0 |
-| Release date | 2026-03-09 |
-| Rust source files | 446 |
-| Lines of code | ~124,000 (151,578 total) |
-| Public modules | 73 |
-| Public API items | 7,326 |
+| Version | 0.1.1 |
+| Release date | 2026-05-03 |
+| Rust source files | 503 |
+| Lines of code | 141,044 (172,763 total) |
+| Public modules | 63 |
+| Public API items | 7,595 |
 | Public types / traits | 1,086 |
-| Passing tests | 3,908 (zero failures) |
+| Passing tests | 4,264 (zero failures) |
 | Runnable examples | 11 |
 | Criterion benchmarks | 3 |
 | C/Fortran dependencies | 0 |
@@ -219,7 +219,7 @@ oxiphoton is built on the COOLJAPAN pure-Rust ecosystem:
 ```
 oxiblas 0.1.2  (pure-Rust BLAS/LAPACK)
 oxifft  0.1.3  (pure-Rust FFT)
-    └── oxiphoton 0.1.0
+    └── oxiphoton 0.1.1
 ```
 
 **Core dependencies:**

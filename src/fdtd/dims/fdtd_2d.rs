@@ -168,6 +168,107 @@ impl DftBox2d {
     }
 }
 
+/// DFT collector for 2D TM fields at multiple frequencies.
+///
+/// TM mode fields: Ez (nx × ny), Hx (nx × (ny+1)), Hy ((nx+1) × ny).
+///
+/// Accumulates the running DFT at each time step using:
+///   F(ω) += field(t) · exp(-i·ω·t) · dt
+///
+/// The `ez_field` method returns the complex Ez snapshot at a given
+/// frequency bin as a flat `Vec<Complex64>` of length `nx * ny`.
+#[derive(Clone)]
+pub struct DftBox2dTm {
+    pub nx: usize,
+    pub ny: usize,
+    pub omegas: Vec<f64>,
+    /// Stored dt for per-step phaser computation
+    pub dt: f64,
+    /// Ez DFT accumulators: [freq][j*nx + i]  (nx × ny cells)
+    pub ez_dft: Vec<Vec<Complex64>>,
+    /// Hx DFT accumulators: [freq][j*nx + i]  (nx × (ny+1) cells)
+    pub hx_dft: Vec<Vec<Complex64>>,
+    /// Hy DFT accumulators: [freq][j*(nx+1) + i]  ((nx+1) × ny cells)
+    pub hy_dft: Vec<Vec<Complex64>>,
+    /// Number of accumulated time steps
+    pub n_steps: usize,
+}
+
+impl DftBox2dTm {
+    /// Create a new TM DFT box.
+    ///
+    /// # Arguments
+    /// * `frequencies_hz` – list of frequencies to monitor (Hz)
+    /// * `nx`, `ny` – grid dimensions (must match the FDTD solver)
+    /// * `dt` – simulation time step (s)
+    pub fn new(frequencies_hz: &[f64], nx: usize, ny: usize, dt: f64) -> Self {
+        let omegas: Vec<f64> = frequencies_hz.iter().map(|&f| 2.0 * PI * f).collect();
+        let nf = omegas.len();
+        Self {
+            nx,
+            ny,
+            omegas,
+            dt,
+            ez_dft: vec![vec![Complex64::new(0.0, 0.0); nx * ny]; nf],
+            hx_dft: vec![vec![Complex64::new(0.0, 0.0); nx * (ny + 1)]; nf],
+            hy_dft: vec![vec![Complex64::new(0.0, 0.0); (nx + 1) * ny]; nf],
+            n_steps: 0,
+        }
+    }
+
+    /// Accumulate fields at the current time step.
+    ///
+    /// `step` is the integer time-step counter; the physical time is `step * dt`.
+    /// `ez` must have length `nx * ny`, `hx` length `nx * (ny+1)`,
+    /// `hy` length `(nx+1) * ny`.
+    pub fn accumulate(&mut self, step: usize, ez: &[f64], hx: &[f64], hy: &[f64]) {
+        let t = step as f64 * self.dt;
+        let dt = self.dt;
+        for (k, &omega) in self.omegas.iter().enumerate() {
+            let phase = Complex64::new(0.0, -omega * t).exp() * dt;
+            let ez_acc = &mut self.ez_dft[k];
+            for (acc, &val) in ez_acc.iter_mut().zip(ez.iter()) {
+                *acc += val * phase;
+            }
+            let hx_acc = &mut self.hx_dft[k];
+            for (acc, &val) in hx_acc.iter_mut().zip(hx.iter()) {
+                *acc += val * phase;
+            }
+            let hy_acc = &mut self.hy_dft[k];
+            for (acc, &val) in hy_acc.iter_mut().zip(hy.iter()) {
+                *acc += val * phase;
+            }
+        }
+        self.n_steps += 1;
+    }
+
+    /// Return the accumulated complex Ez field at frequency bin `freq_idx`.
+    ///
+    /// Returns a `Vec<Complex64>` of length `nx * ny` (row-major, j × nx + i).
+    /// Returns an empty Vec if `freq_idx` is out of range.
+    pub fn ez_field(&self, freq_idx: usize) -> Vec<Complex64> {
+        self.ez_dft.get(freq_idx).cloned().unwrap_or_default()
+    }
+
+    /// Return the accumulated complex Hx field at frequency bin `freq_idx`.
+    pub fn hx_field(&self, freq_idx: usize) -> Vec<Complex64> {
+        self.hx_dft.get(freq_idx).cloned().unwrap_or_default()
+    }
+
+    /// Return the accumulated complex Hy field at frequency bin `freq_idx`.
+    pub fn hy_field(&self, freq_idx: usize) -> Vec<Complex64> {
+        self.hy_dft.get(freq_idx).cloned().unwrap_or_default()
+    }
+
+    /// Peak |Ez(f)| across all cells for the given frequency bin.
+    pub fn peak_ez_magnitude(&self, freq_idx: usize) -> f64 {
+        self.ez_dft
+            .get(freq_idx)
+            .map(|v| v.iter().map(|c| c.norm()).fold(0.0_f64, f64::max))
+            .unwrap_or(0.0)
+    }
+}
+
 /// 2D TE FDTD solver (Hz, Ex, Ey)
 ///
 /// TE mode in 2D: Hz, Ex, Ey nonzero.
@@ -462,6 +563,209 @@ impl Fdtd2dTe {
             .iter()
             .cloned()
             .fold(0.0_f64, |a, v| a.max(v.abs()))
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Parallel field updates (feature-gated)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Parallel H-field update for 2D TE mode (Hz) with CPML.
+    ///
+    /// Uses snapshot/par_iter/sequential-writeback pattern.
+    /// Produces the same result as the serial step() Hz-update.
+    #[cfg(feature = "parallel")]
+    pub fn update_h_parallel(&mut self) {
+        use rayon::prelude::*;
+
+        let nx = self.grid.nx;
+        let ny = self.grid.ny;
+        let dx = self.grid.dx;
+        let dy = self.grid.dy;
+        let dt = self.dt;
+
+        // Snapshot arrays
+        let hz_snap = self.grid.hz.clone();
+        let ex_snap = self.grid.ex.clone();
+        let ey_snap = self.grid.ey.clone();
+        let mu_hz_snap = self.grid.mu_hz.clone();
+        let psi_hz_x_snap = self.psi_hz_x.clone();
+        let psi_hz_y_snap = self.psi_hz_y.clone();
+        let pml_x_b_h = self.pml_x.b_h.clone();
+        let pml_x_c_h = self.pml_x.c_h.clone();
+        let pml_x_kappa_h = self.pml_x.kappa_h.clone();
+        let pml_y_b_h = self.pml_y.b_h.clone();
+        let pml_y_c_h = self.pml_y.c_h.clone();
+        let pml_y_kappa_h = self.pml_y.kappa_h.clone();
+
+        // Hz update: j in 0..ny, i in 0..nx
+        // hz_idx = j * nx + i
+        // dHz/dt = (1/mu) * ((Ex[i,j+1] - Ex[i,j])/dy - (Ey[i+1,j] - Ey[i,j])/dx)
+        // ex_idx_top = (j+1)*(nx+1)+i, ex_idx_bot = j*(nx+1)+i
+        // ey_idx at i+1 = j*nx+(i+1), at i = j*nx+i
+        let hz_updates: Vec<(usize, f64, f64, f64)> = (0..ny)
+            .into_par_iter()
+            .flat_map(|j| {
+                let hz_snap = &hz_snap;
+                let ex_snap = &ex_snap;
+                let ey_snap = &ey_snap;
+                let mu_hz_snap = &mu_hz_snap;
+                let psi_x_snap = &psi_hz_x_snap;
+                let psi_y_snap = &psi_hz_y_snap;
+                let b_h_x = &pml_x_b_h;
+                let c_h_x = &pml_x_c_h;
+                let kappa_h_x = &pml_x_kappa_h;
+                let b_h_y = &pml_y_b_h;
+                let c_h_y = &pml_y_c_h;
+                let kappa_h_y = &pml_y_kappa_h;
+                (0..nx)
+                    .map(move |i| {
+                        let idx_hz = j * nx + i;
+                        let idx_ex_top = (j + 1) * (nx + 1) + i;
+                        let idx_ex_bot = j * (nx + 1) + i;
+
+                        let dex_dy = if j + 1 < ny {
+                            (ex_snap[idx_ex_top] - ex_snap[idx_ex_bot]) / dy
+                        } else {
+                            (0.0 - ex_snap[idx_ex_bot]) / dy
+                        };
+
+                        let dey_dx = if i + 1 < nx {
+                            (ey_snap[j * nx + i + 1] - ey_snap[j * nx + i]) / dx
+                        } else {
+                            (0.0 - ey_snap[j * nx + i]) / dx
+                        };
+
+                        let psi_hz_x_new = b_h_x[i] * psi_x_snap[idx_hz] + c_h_x[i] * dey_dx;
+                        let psi_hz_y_new = b_h_y[j] * psi_y_snap[idx_hz] + c_h_y[j] * dex_dy;
+
+                        let kx = kappa_h_x[i];
+                        let ky = kappa_h_y[j];
+                        let mu = MU_0 * mu_hz_snap[idx_hz];
+
+                        let hz_new = hz_snap[idx_hz]
+                            + dt / mu * (dex_dy / ky - dey_dx / kx + psi_hz_y_new - psi_hz_x_new);
+                        (idx_hz, hz_new, psi_hz_x_new, psi_hz_y_new)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (idx, hz_new, psi_x_new, psi_y_new) in hz_updates {
+            self.grid.hz[idx] = hz_new;
+            self.psi_hz_x[idx] = psi_x_new;
+            self.psi_hz_y[idx] = psi_y_new;
+        }
+    }
+
+    /// Parallel E-field update for 2D TE mode (Ex, Ey) with CPML.
+    ///
+    /// Uses snapshot/par_iter/sequential-writeback pattern.
+    /// Produces the same result as the serial step() Ex/Ey-update.
+    #[cfg(feature = "parallel")]
+    pub fn update_e_parallel(&mut self) {
+        use rayon::prelude::*;
+
+        let nx = self.grid.nx;
+        let ny = self.grid.ny;
+        let dx = self.grid.dx;
+        let dy = self.grid.dy;
+        let dt = self.dt;
+
+        let hz_snap = self.grid.hz.clone();
+        let ex_snap = self.grid.ex.clone();
+        let ey_snap = self.grid.ey.clone();
+        let eps_ex_snap = self.grid.eps_ex.clone();
+        let eps_ey_snap = self.grid.eps_ey.clone();
+        let psi_ex_y_snap = self.psi_ex_y.clone();
+        let psi_ey_x_snap = self.psi_ey_x.clone();
+        let pml_x_b_e = self.pml_x.b_e.clone();
+        let pml_x_c_e = self.pml_x.c_e.clone();
+        let pml_x_kappa_e = self.pml_x.kappa_e.clone();
+        let pml_y_b_e = self.pml_y.b_e.clone();
+        let pml_y_c_e = self.pml_y.c_e.clone();
+        let pml_y_kappa_e = self.pml_y.kappa_e.clone();
+
+        // Ex update: j in 0..ny, i in 0..=nx
+        // ex_idx = j*(nx+1)+i
+        // dEx/dt = (1/eps) * dHz/dy   (backward diff: Hz[j] - Hz[j-1])
+        let ex_updates: Vec<(usize, f64, f64)> = (0..ny)
+            .into_par_iter()
+            .flat_map(|j| {
+                let hz_snap = &hz_snap;
+                let ex_snap = &ex_snap;
+                let eps_ex_snap = &eps_ex_snap;
+                let psi_snap = &psi_ex_y_snap;
+                let b_e = &pml_y_b_e;
+                let c_e = &pml_y_c_e;
+                let kappa_e = &pml_y_kappa_e;
+                (0..=nx)
+                    .map(move |i| {
+                        let idx_ex = j * (nx + 1) + i;
+                        let dhz_dy = if i < nx {
+                            if j > 0 {
+                                (hz_snap[j * nx + i] - hz_snap[(j - 1) * nx + i]) / dy
+                            } else {
+                                hz_snap[j * nx + i] / dy
+                            }
+                        } else {
+                            0.0
+                        };
+                        let psi_new = b_e[j] * psi_snap[idx_ex] + c_e[j] * dhz_dy;
+                        let ky = kappa_e[j];
+                        let eps = EPSILON_0 * eps_ex_snap[idx_ex];
+                        let ex_new = ex_snap[idx_ex] + dt / eps * (dhz_dy / ky + psi_new);
+                        (idx_ex, ex_new, psi_new)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (idx, ex_new, psi_new) in ex_updates {
+            self.grid.ex[idx] = ex_new;
+            self.psi_ex_y[idx] = psi_new;
+        }
+
+        // Ey update: j in 0..=ny, i in 0..nx
+        // ey_idx = j*nx+i
+        // dEy/dt = -(1/eps) * dHz/dx   (backward diff: Hz[i] - Hz[i-1])
+        let ey_updates: Vec<(usize, f64, f64)> = (0..=ny)
+            .into_par_iter()
+            .flat_map(|j| {
+                let hz_snap = &hz_snap;
+                let ey_snap = &ey_snap;
+                let eps_ey_snap = &eps_ey_snap;
+                let psi_snap = &psi_ey_x_snap;
+                let b_e = &pml_x_b_e;
+                let c_e = &pml_x_c_e;
+                let kappa_e = &pml_x_kappa_e;
+                (0..nx)
+                    .map(move |i| {
+                        let idx_ey = j * nx + i;
+                        let dhz_dx = if j < ny {
+                            if i > 0 {
+                                (hz_snap[j * nx + i] - hz_snap[j * nx + i - 1]) / dx
+                            } else {
+                                hz_snap[j * nx + i] / dx
+                            }
+                        } else {
+                            0.0
+                        };
+                        let psi_new = b_e[i] * psi_snap[idx_ey] + c_e[i] * dhz_dx;
+                        let kx = kappa_e[i];
+                        let eps = EPSILON_0 * eps_ey_snap[idx_ey];
+                        let ey_new = ey_snap[idx_ey] - dt / eps * (dhz_dx / kx + psi_new);
+                        (idx_ey, ey_new, psi_new)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (idx, ey_new, psi_new) in ey_updates {
+            self.grid.ey[idx] = ey_new;
+            self.psi_ey_x[idx] = psi_new;
+        }
+
+        self.time_step += 1;
     }
 
     /// Total electromagnetic energy.
@@ -880,6 +1184,192 @@ impl Fdtd2dTm {
                 probe.data.push((t, ez));
             }
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Parallel field updates (feature-gated)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Parallel H-field update for 2D TM mode (Hx, Hy) with CPML.
+    ///
+    /// Uses snapshot/par_iter/sequential-writeback pattern identical to Fdtd3d.
+    /// Produces the same result as the serial step() H-update.
+    #[cfg(feature = "parallel")]
+    pub fn update_h_parallel(&mut self) {
+        use rayon::prelude::*;
+
+        let nx = self.nx;
+        let ny = self.ny;
+        let dx = self.dx;
+        let dy = self.dy;
+        let dt = self.dt;
+
+        // Snapshot all arrays needed for read access
+        let ez_snap = self.ez.clone();
+        let hx_snap = self.hx.clone();
+        let hy_snap = self.hy.clone();
+        let psi_hx_y_snap = self.psi_hx_y.clone();
+        let psi_hy_x_snap = self.psi_hy_x.clone();
+        let pml_y_b_h = self.pml_y.b_h.clone();
+        let pml_y_c_h = self.pml_y.c_h.clone();
+        let pml_y_kappa_h = self.pml_y.kappa_h.clone();
+        let pml_x_b_h = self.pml_x.b_h.clone();
+        let pml_x_c_h = self.pml_x.c_h.clone();
+        let pml_x_kappa_h = self.pml_x.kappa_h.clone();
+
+        // Compute Hx updates: Hx[i,j] at j in 0..ny, i in 0..nx
+        // hx_idx(i,j) = j * nx + i  (size nx*(ny+1), but we update 0..ny rows)
+        let hx_updates: Vec<(usize, f64, f64)> = (0..ny)
+            .into_par_iter()
+            .flat_map(|j| {
+                let ez_snap = &ez_snap;
+                let hx_snap = &hx_snap;
+                let psi_snap = &psi_hx_y_snap;
+                let b_h = &pml_y_b_h;
+                let c_h = &pml_y_c_h;
+                let kappa_h = &pml_y_kappa_h;
+                (0..nx)
+                    .map(move |i| {
+                        let idx_hx = j * nx + i;
+                        let ez_j1 = if j + 1 < ny {
+                            ez_snap[(j + 1) * nx + i]
+                        } else {
+                            0.0
+                        };
+                        let dez_dy = (ez_j1 - ez_snap[j * nx + i]) / dy;
+                        let psi_new = b_h[j] * psi_snap[idx_hx] + c_h[j] * dez_dy;
+                        let ky = kappa_h[j];
+                        let hx_new = hx_snap[idx_hx] - dt / MU_0 * (dez_dy / ky + psi_new);
+                        (idx_hx, hx_new, psi_new)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (idx, hx_new, psi_new) in hx_updates {
+            self.hx[idx] = hx_new;
+            self.psi_hx_y[idx] = psi_new;
+        }
+
+        // Compute Hy updates: Hy[i,j] at j in 0..ny, i in 0..nx
+        // hy_idx(i,j) = j * (nx+1) + i
+        let hy_updates: Vec<(usize, f64, f64)> = (0..ny)
+            .into_par_iter()
+            .flat_map(|j| {
+                let ez_snap = &ez_snap;
+                let hy_snap = &hy_snap;
+                let psi_snap = &psi_hy_x_snap;
+                let b_h = &pml_x_b_h;
+                let c_h = &pml_x_c_h;
+                let kappa_h = &pml_x_kappa_h;
+                (0..nx)
+                    .map(move |i| {
+                        let idx_hy = j * (nx + 1) + i;
+                        let ez_i1 = if i + 1 < nx {
+                            ez_snap[j * nx + i + 1]
+                        } else {
+                            0.0
+                        };
+                        let dez_dx = (ez_i1 - ez_snap[j * nx + i]) / dx;
+                        let psi_new = b_h[i] * psi_snap[idx_hy] + c_h[i] * dez_dx;
+                        let kx = kappa_h[i];
+                        let hy_new = hy_snap[idx_hy] + dt / MU_0 * (dez_dx / kx + psi_new);
+                        (idx_hy, hy_new, psi_new)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (idx, hy_new, psi_new) in hy_updates {
+            self.hy[idx] = hy_new;
+            self.psi_hy_x[idx] = psi_new;
+        }
+    }
+
+    /// Parallel E-field update for 2D TM mode (Ez) with CPML.
+    ///
+    /// Uses snapshot/par_iter/sequential-writeback pattern.
+    /// Produces the same result as the serial step() E-update.
+    #[cfg(feature = "parallel")]
+    pub fn update_e_parallel(&mut self) {
+        use rayon::prelude::*;
+
+        let nx = self.nx;
+        let ny = self.ny;
+        let dx = self.dx;
+        let dy = self.dy;
+        let dt = self.dt;
+
+        let ez_snap = self.ez.clone();
+        let hx_snap = self.hx.clone();
+        let hy_snap = self.hy.clone();
+        let eps_r_snap = self.eps_r.clone();
+        let psi_ez_x_snap = self.psi_ez_x.clone();
+        let psi_ez_y_snap = self.psi_ez_y.clone();
+        let pml_x_b_e = self.pml_x.b_e.clone();
+        let pml_x_c_e = self.pml_x.c_e.clone();
+        let pml_x_kappa_e = self.pml_x.kappa_e.clone();
+        let pml_y_b_e = self.pml_y.b_e.clone();
+        let pml_y_c_e = self.pml_y.c_e.clone();
+        let pml_y_kappa_e = self.pml_y.kappa_e.clone();
+
+        // Ez update: j in 0..ny, i in 0..nx
+        // dEz/dt = (1/eps) * ((Hy[i,j] - Hy[i-1,j])/dx - (Hx[i,j] - Hx[i,j-1])/dy)
+        let ez_updates: Vec<(usize, f64, f64, f64)> = (0..ny)
+            .into_par_iter()
+            .flat_map(|j| {
+                let ez_snap = &ez_snap;
+                let hx_snap = &hx_snap;
+                let hy_snap = &hy_snap;
+                let eps_r_snap = &eps_r_snap;
+                let psi_x_snap = &psi_ez_x_snap;
+                let psi_y_snap = &psi_ez_y_snap;
+                let b_e_x = &pml_x_b_e;
+                let c_e_x = &pml_x_c_e;
+                let kappa_e_x = &pml_x_kappa_e;
+                let b_e_y = &pml_y_b_e;
+                let c_e_y = &pml_y_c_e;
+                let kappa_e_y = &pml_y_kappa_e;
+                (0..nx)
+                    .map(move |i| {
+                        let idx = j * nx + i;
+                        // hy_idx(i,j) = j*(nx+1)+i, hy_idx(i-1,j) = j*(nx+1)+(i-1)
+                        let dhy_dx = if i > 0 {
+                            (hy_snap[j * (nx + 1) + i] - hy_snap[j * (nx + 1) + i - 1]) / dx
+                        } else {
+                            hy_snap[j * (nx + 1) + i] / dx
+                        };
+                        // hx_idx(i,j) = j*nx+i, hx_idx(i,j-1) = (j-1)*nx+i
+                        let dhx_dy = if j > 0 {
+                            (hx_snap[j * nx + i] - hx_snap[(j - 1) * nx + i]) / dy
+                        } else {
+                            hx_snap[j * nx + i] / dy
+                        };
+                        let psi_x_new = b_e_x[i] * psi_x_snap[idx] + c_e_x[i] * dhy_dx;
+                        let psi_y_new = b_e_y[j] * psi_y_snap[idx] + c_e_y[j] * dhx_dy;
+                        let kx = kappa_e_x[i];
+                        let ky = kappa_e_y[j];
+                        let eps = EPSILON_0 * eps_r_snap[idx];
+                        let ez_new = ez_snap[idx]
+                            + dt / eps * ((dhy_dx / kx + psi_x_new) - (dhx_dy / ky + psi_y_new));
+                        (idx, ez_new, psi_x_new, psi_y_new)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (idx, ez_new, psi_x_new, psi_y_new) in ez_updates {
+            self.ez[idx] = ez_new;
+            self.psi_ez_x[idx] = psi_x_new;
+            self.psi_ez_y[idx] = psi_y_new;
+        }
+
+        self.time_step += 1;
+    }
+
+    /// Total electromagnetic energy (alias for `total_energy_tm`).
+    pub fn total_energy(&self) -> f64 {
+        self.total_energy_tm()
     }
 }
 

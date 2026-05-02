@@ -126,7 +126,10 @@ impl PhotonicNetwork {
 
     /// Network power efficiency: total power consumed by nodes / TX power.
     ///
-    /// For bus topology, each node consumes the drop fraction of arriving power.
+    /// For bus and ring topologies, each node consumes the drop fraction of
+    /// arriving power. For ring, the signal traverses all N link segments and
+    /// N nodes (the closing link back to the source attenuates only residual
+    /// power that returns unused and is not counted in the efficiency sum).
     /// Efficiency ∈ [0, 1].
     pub fn power_efficiency(&self) -> f64 {
         match self.topology {
@@ -146,7 +149,31 @@ impl PhotonicNetwork {
                 }
                 (total_consumed_mw / tx_mw).min(1.0)
             }
-            _ => 0.0, // stub for other topologies
+            NetworkTopology::Ring => {
+                let tx_mw = self.tx_power_mw();
+                if tx_mw <= 0.0 {
+                    return 0.0;
+                }
+                let link_factor = 10.0_f64.powf(-self.link_loss_db / 10.0);
+                let mut power_mw = tx_mw;
+                let mut total_consumed_mw = 0.0f64;
+                for node in &self.nodes {
+                    power_mw *= link_factor; // link before this node
+                    let node_factor = 10.0_f64.powf(-node.loss_db / 10.0);
+                    total_consumed_mw += power_mw * (1.0 - node_factor);
+                    power_mw *= node_factor;
+                }
+                // The closing link (last node back to first) attenuates only
+                // residual power returning to the source; that power is not
+                // consumed at any node and does not enter the efficiency sum.
+                (total_consumed_mw / tx_mw).min(1.0)
+            }
+            NetworkTopology::Mesh => {
+                // Mesh efficiency cannot be computed from PhotonicNetwork's node
+                // list alone (requires an explicit adjacency graph). Use
+                // `PhotonicTopology` for arbitrary mesh topologies.
+                0.0
+            }
         }
     }
 }
@@ -512,6 +539,16 @@ mod tests {
         let net = PhotonicNetwork::bus(4, 0.0, 0.5, 1.0);
         let eta = net.power_efficiency();
         assert!((0.0..=1.0).contains(&eta), "η={eta:.4}");
+    }
+
+    #[test]
+    fn ring_power_efficiency_nonzero() {
+        // 3-node ring: 1 dB link loss, 0.5 dB node loss each.
+        // Signal traverses 3 links and 3 nodes; closing link loss is not counted.
+        let net = PhotonicNetwork::ring(3, 0.0, 1.0, 0.5);
+        let eff = net.power_efficiency();
+        assert!(eff > 0.0, "ring efficiency must be > 0, got {eff}");
+        assert!(eff <= 1.0, "ring efficiency must be ≤ 1, got {eff}");
     }
 
     #[test]

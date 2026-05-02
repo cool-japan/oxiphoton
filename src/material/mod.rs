@@ -49,3 +49,4 @@ pub mod gain;
 pub use anisotropic::{AnisotropicMaterial, DielectricTensor};
 pub use gain::{GainMedium, LaserModel, TwoLevelMedium};
 pub use nonlinear::raman::RamanMaterial;
+pub use pml::PmlCellProfiles;

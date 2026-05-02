@@ -18,7 +18,7 @@ pub use config::{
 };
 pub use courant::courant_dt;
 pub use dims::fdtd_1d::Fdtd1d;
-pub use dims::fdtd_2d::{DftBox2d, Fdtd2dTe, Fdtd2dTm, TfsfConfig, TfsfSource};
+pub use dims::fdtd_2d::{DftBox2d, DftBox2dTm, Fdtd2dTe, Fdtd2dTm, TfsfConfig, TfsfSource};
 pub use dims::fdtd_3d::{
     Axis3d, Checkpoint3d, CwWaveform3d, DftProbe3d, Fdtd3d, Fdtd3dMaterial, FieldComponent3d,
     FieldProbe3d, GaussianPulse3d, GaussianWaveform3d, PlaneMonitor3d, SourceType3d,

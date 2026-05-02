@@ -12,6 +12,8 @@
 use num_complex::Complex64;
 use std::f64::consts::PI;
 
+pub use crate::nonlinear_crystal::PhaseMatchingType;
+
 /// Speed of light in vacuum (m/s)
 const C: f64 = 2.997_924_58e8;
 /// Permittivity of free space (F/m)
@@ -138,23 +140,34 @@ impl SpdcCrystal {
     }
 }
 
-// ─── Phase matching type ──────────────────────────────────────────────────────
+// ─── Joint Spectral Amplitude ─────────────────────────────────────────────────
 
-/// Phase-matching configuration for SPDC.
+/// Joint Spectral Amplitude f(ω_s, ω_i) on a 2D frequency grid.
+///
+/// The amplitude matrix is stored as a row-major 2D vec of Complex64, indexed
+/// `[signal_index][idler_index]`, and is normalised so that Σ|f|² = 1.
 #[derive(Debug, Clone)]
-pub enum PhaseMatchingType {
-    /// Type-I: extraordinary pump → ordinary signal + ordinary idler (e→o+o)
-    TypeI,
-    /// Type-II: extraordinary pump → extraordinary signal + ordinary idler (e→e+o)
-    /// Produces polarisation-entangled pairs naturally.
-    TypeII,
-    /// Type-0: all fields share the same polarisation (requires QPM)
-    TypeZero,
-    /// Quasi-phase-matching via periodic poling
-    Qpm {
-        /// Poling period (µm)
-        poling_period_um: f64,
-    },
+pub struct JointSpectralAmplitude {
+    /// Signal angular frequencies (rad/s), length = `n_signal`.
+    pub signal_freqs: Vec<f64>,
+    /// Idler angular frequencies (rad/s), length = `n_idler`.
+    pub idler_freqs: Vec<f64>,
+    /// 2D amplitude matrix: `amplitude[i_s][i_i]` = f(ω_s at signal index, ω_i at idler index).
+    pub amplitude: Vec<Vec<Complex64>>,
+}
+
+// ─── Schmidt decomposition ────────────────────────────────────────────────────
+
+/// Schmidt decomposition of the JSA.
+///
+/// The JSA is decomposed as f(ω_s, ω_i) = Σ_k √λ_k · ψ_k(ω_s) · φ_k(ω_i),
+/// where {λ_k} are the Schmidt eigenvalues (normalised so Σλ_k = 1).
+#[derive(Debug, Clone)]
+pub struct SchmidtDecomposition {
+    /// Schmidt eigenvalues λ_k in descending order, Σλ_k = 1.
+    pub eigenvalues: Vec<f64>,
+    /// Schmidt number K = 1/Σλ_k² ≥ 1.
+    pub schmidt_number: f64,
 }
 
 // ─── SPDC source ─────────────────────────────────────────────────────────────
@@ -197,9 +210,7 @@ impl SpdcSource {
             pump_wavelength: 780e-9,
             pump_power_mw,
             crystal_length_mm: length_mm,
-            phase_matching: PhaseMatchingType::Qpm {
-                poling_period_um: 19.3,
-            },
+            phase_matching: PhaseMatchingType::QuasiPm { period_um: 19.3 },
         }
     }
 
@@ -311,11 +322,11 @@ impl SpdcSource {
 
     /// Joint Spectral Amplitude f(ω_s, ω_i) on an n×n frequency grid.
     ///
-    /// Gaussian approximation:
     /// ```text
-    /// f(ω_s, ω_i) = α(ω_s + ω_i) · φ(ω_s, ω_i)
+    /// f(ω_s, ω_i) = α(ω_s + ω_i) · sinc(Δk(ω_s,ω_i)·L/2)
     /// ```
-    /// where α is the pump envelope (Gaussian) and φ is the phase-matching function (sinc).
+    /// where α is the Gaussian pump envelope, and Δk uses the GVM linearisation:
+    /// Δk ≈ GVM·(ω_s − ω_s0).
     ///
     /// Returns `(signal_freqs_hz, idler_freqs_hz, jsa_matrix)`.
     pub fn joint_spectral_amplitude(
@@ -363,11 +374,7 @@ impl SpdcSource {
                 // Phase-matching: sinc(Δk·L/2) where Δk ≈ GVM·(ω_s - ω_s0)
                 let delta_omega_s = omega_s - omega_s0;
                 let delta_k_l_half = gvm * delta_omega_s * l / 2.0;
-                let pm = if delta_k_l_half.abs() < 1e-12 {
-                    1.0
-                } else {
-                    delta_k_l_half.sin() / delta_k_l_half
-                };
+                let pm = sinc(delta_k_l_half);
 
                 let val = pump_env * pm;
                 jsa[si][ii] = Complex64::new(val, 0.0);
@@ -440,7 +447,271 @@ impl SpdcSource {
     }
 }
 
+// ─── Integrated SPDC source ───────────────────────────────────────────────────
+
+/// Integrated waveguide SPDC source with real sinc(ΔkL/2) phase-matching JSA.
+///
+/// Unlike `SpdcSource`, this struct carries explicit refractive and group indices
+/// for all three fields (pump/signal/idler), enabling a physically accurate
+/// computation of Δk(ω_s, ω_i) = k_p(ω_s+ω_i) − k_s(ω_s) − k_i(ω_i) − K_qpm.
+///
+/// # References
+/// - Grice & Walmsley, PRA 1997 (JSA factorability)
+/// - Mosley et al., PRL 2008 (group-index engineered pairs)
+/// - Law & Eberly, PRL 2004 (Schmidt decomposition of JSA)
+#[derive(Debug, Clone)]
+pub struct IntegratedSpdcSource {
+    /// Crystal (waveguide) length (m).
+    pub crystal_length: f64,
+    /// Effective mode area A_eff (m²).
+    pub effective_area: f64,
+    /// Phase-matching configuration.
+    pub phase_matching: PhaseMatchingType,
+    /// Pump centre wavelength (m).
+    pub pump_wavelength: f64,
+    /// Pump bandwidth FWHM (Hz, ordinary frequency).
+    pub pump_bandwidth_fwhm: f64,
+    /// Effective nonlinear coefficient d_eff (m/V). Note: 1 pm/V = 1e-12 m/V.
+    pub d_eff: f64,
+    /// Phase index at pump centre frequency.
+    pub n_p: f64,
+    /// Phase index at signal centre frequency (degenerate: λ_s = 2·λ_pump).
+    pub n_s: f64,
+    /// Phase index at idler centre frequency.
+    pub n_i: f64,
+    /// Group index at pump centre frequency.
+    pub n_g_p: f64,
+    /// Group index at signal centre frequency.
+    pub n_g_s: f64,
+    /// Group index at idler centre frequency.
+    pub n_g_i: f64,
+}
+
+impl IntegratedSpdcSource {
+    /// Pump centre angular frequency (rad/s).
+    fn omega_p0(&self) -> f64 {
+        2.0 * PI * C / self.pump_wavelength
+    }
+
+    /// Signal centre angular frequency (rad/s) — degenerate: ω_s0 = ω_p0/2.
+    fn omega_s0(&self) -> f64 {
+        self.omega_p0() / 2.0
+    }
+
+    /// Idler centre angular frequency (rad/s) — degenerate: ω_i0 = ω_p0/2.
+    fn omega_i0(&self) -> f64 {
+        self.omega_p0() / 2.0
+    }
+
+    /// Pump Gaussian bandwidth σ_ω (rad/s), converting FWHM in Hz.
+    ///
+    /// σ_freq = FWHM/(2√(2 ln 2)); σ_ω = 2π·σ_freq.
+    fn sigma_omega_pump(&self) -> f64 {
+        let sigma_freq = self.pump_bandwidth_fwhm / (2.0 * (2.0_f64 * 2.0_f64.ln()).sqrt());
+        2.0 * PI * sigma_freq
+    }
+
+    /// Wave-vector k_j(ω) using first-order Taylor expansion about the centre frequency:
+    ///
+    /// k_j(ω) = n_j·ω_0j/c + (n_g_j/c)·(ω − ω_0j)
+    ///
+    /// where ω_0j is the centre frequency for field j.
+    fn k_pump(&self, omega: f64) -> f64 {
+        let omega_0 = self.omega_p0();
+        self.n_p * omega_0 / C + (self.n_g_p / C) * (omega - omega_0)
+    }
+
+    fn k_signal(&self, omega: f64) -> f64 {
+        let omega_0 = self.omega_s0();
+        self.n_s * omega_0 / C + (self.n_g_s / C) * (omega - omega_0)
+    }
+
+    fn k_idler(&self, omega: f64) -> f64 {
+        let omega_0 = self.omega_i0();
+        self.n_i * omega_0 / C + (self.n_g_i / C) * (omega - omega_0)
+    }
+
+    /// QPM grating vector K_qpm = 2π/Λ (rad/m); 0 for non-QPM types.
+    fn k_qpm(&self) -> f64 {
+        match &self.phase_matching {
+            PhaseMatchingType::QuasiPm { period_um } => 2.0 * PI / (period_um * 1e-6),
+            _ => 0.0,
+        }
+    }
+
+    /// Phase mismatch Δk(ω_s, ω_i) = k_p(ω_s+ω_i) − k_s(ω_s) − k_i(ω_i) − K_qpm.
+    fn delta_k(&self, omega_s: f64, omega_i: f64) -> f64 {
+        let omega_p = omega_s + omega_i;
+        self.k_pump(omega_p) - self.k_signal(omega_s) - self.k_idler(omega_i) - self.k_qpm()
+    }
+
+    /// Pump Gaussian envelope α_p(ω_p) = exp(−(ω_p − ω_p0)²/(2·σ_ω²)).
+    fn pump_envelope(&self, omega_p: f64) -> f64 {
+        let sigma = self.sigma_omega_pump();
+        let delta = omega_p - self.omega_p0();
+        (-delta * delta / (2.0 * sigma * sigma)).exp()
+    }
+
+    /// Compute the JSA on a `ds × di` frequency grid centred on degeneracy.
+    ///
+    /// The grid spans ±3·σ_ω (pump bandwidth) around the degenerate frequency.
+    pub fn jsa(&self, ds: usize, di: usize) -> JointSpectralAmplitude {
+        let ns = ds.max(4);
+        let ni = di.max(4);
+        let omega_s0 = self.omega_s0();
+        let omega_i0 = self.omega_i0();
+        let sigma = self.sigma_omega_pump();
+        let half_span = 3.0 * sigma;
+        let l = self.crystal_length;
+
+        let signal_freqs: Vec<f64> = (0..ns)
+            .map(|i| omega_s0 - half_span + (2.0 * half_span) * (i as f64) / ((ns - 1) as f64))
+            .collect();
+        let idler_freqs: Vec<f64> = (0..ni)
+            .map(|i| omega_i0 - half_span + (2.0 * half_span) * (i as f64) / ((ni - 1) as f64))
+            .collect();
+
+        let mut amplitude = vec![vec![Complex64::new(0.0, 0.0); ni]; ns];
+        let mut norm_sq = 0.0_f64;
+
+        for (si, &omega_s) in signal_freqs.iter().enumerate() {
+            for (ii, &omega_i) in idler_freqs.iter().enumerate() {
+                let alpha = self.pump_envelope(omega_s + omega_i);
+                let dk_l_half = self.delta_k(omega_s, omega_i) * l / 2.0;
+                let pm = sinc(dk_l_half);
+                let val = alpha * pm;
+                amplitude[si][ii] = Complex64::new(val, 0.0);
+                norm_sq += val * val;
+            }
+        }
+
+        // Normalise so Σ|f|² = 1
+        if norm_sq > 0.0 {
+            let norm = norm_sq.sqrt();
+            for row in &mut amplitude {
+                for v in row.iter_mut() {
+                    *v /= norm;
+                }
+            }
+        }
+
+        JointSpectralAmplitude {
+            signal_freqs,
+            idler_freqs,
+            amplitude,
+        }
+    }
+
+    /// Schmidt decomposition via SVD of the JSA amplitude matrix.
+    ///
+    /// Computes singular values of the n×n JSA sub-matrix (taking the min of
+    /// the ds/di dimensions). Returns eigenvalues λ_k = σ_k²/Σσ_j² in
+    /// descending order.
+    pub fn schmidt_decomposition(&self, n: usize) -> SchmidtDecomposition {
+        let jsa = self.jsa(n, n);
+        let dim = jsa.amplitude.len();
+        if dim == 0 {
+            return SchmidtDecomposition {
+                eigenvalues: vec![1.0],
+                schmidt_number: 1.0,
+            };
+        }
+
+        // Build real matrix (JSA is real-valued in our model)
+        let a: Vec<Vec<f64>> = jsa
+            .amplitude
+            .iter()
+            .map(|row| row.iter().map(|v| v.re).collect())
+            .collect();
+
+        // S = A^T A; eigenvalues of S = squared singular values of A
+        let s = mat_transpose_times_mat(&a, dim);
+        let raw_eigs = symmetric_eigenvalues_power_deflation(&s, dim, dim.min(64));
+
+        let mut lambdas: Vec<f64> = raw_eigs.into_iter().filter(|&v| v > 1e-14).collect();
+        lambdas.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Normalise Σλ = 1
+        let total: f64 = lambdas.iter().sum();
+        if total > 0.0 {
+            for v in lambdas.iter_mut() {
+                *v /= total;
+            }
+        } else {
+            lambdas = vec![1.0];
+        }
+
+        let sum_sq: f64 = lambdas.iter().map(|&l| l * l).sum();
+        let schmidt_number = if sum_sq > 0.0 { 1.0 / sum_sq } else { 1.0 };
+
+        SchmidtDecomposition {
+            eigenvalues: lambdas,
+            schmidt_number,
+        }
+    }
+
+    /// Hong-Ou-Mandel visibility = 1/Σλ_k² = Schmidt number.
+    ///
+    /// For a spectrally pure (single-mode) state: visibility → 1.
+    /// For a mixed state (K modes): visibility = K / (K² - ... ) < 1.
+    /// Uses 20 Schmidt modes.
+    pub fn hom_visibility(&self) -> f64 {
+        let decomp = self.schmidt_decomposition(20);
+        let sum_sq: f64 = decomp.eigenvalues.iter().map(|&l| l * l).sum();
+        if sum_sq > 0.0 {
+            (1.0 / sum_sq).min(1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Pair generation rate [pairs/s] at given pump power.
+    ///
+    /// Formula (waveguide):
+    /// ```text
+    /// R = (8π² · d_eff² · L · P_pump) / (ε₀ · c · n_p·n_s·n_i · λ_p³ · A_eff)
+    /// ```
+    /// Note: d_eff is in SI units (m/V); 1 pm/V = 1e-12 m/V.
+    pub fn pair_generation_rate(&self, pump_power_w: f64) -> f64 {
+        let lambda_p = self.pump_wavelength;
+        let numerator =
+            8.0 * PI * PI * self.d_eff * self.d_eff * self.crystal_length * pump_power_w;
+        let denominator =
+            EPSILON_0 * C * self.n_p * self.n_s * self.n_i * lambda_p.powi(3) * self.effective_area;
+        numerator / denominator
+    }
+
+    /// Spectral brightness [pairs/(s·mW·nm)].
+    ///
+    /// Normalises the pair rate by pump power (mW) and the sinc FWHM bandwidth (nm).
+    pub fn brightness_per_mw_per_nm(&self) -> f64 {
+        // Signal centre wavelength
+        let lambda_s = 2.0 * self.pump_wavelength;
+        // GVM = (n_g_s - n_g_i)/c; bandwidth = 0.886·λ_s²/(c·L·|GVM_wavelength_units|)
+        let gvm = (self.n_g_s - self.n_g_i).abs() / C; // s/m
+        let bandwidth_nm = if gvm < 1e-20 {
+            10.0 // fallback for degenerate / type-0
+        } else {
+            let delta_omega = 0.886 * PI / (self.crystal_length * gvm);
+            let delta_lambda = (lambda_s * lambda_s / (2.0 * PI * C)) * delta_omega;
+            delta_lambda * 1e9 // m → nm
+        };
+        // Rate at 1 mW
+        let r = self.pair_generation_rate(1e-3);
+        r / (1.0 * bandwidth_nm)
+    }
+}
+
 // ─── Linear algebra helpers ───────────────────────────────────────────────────
+
+/// sinc(x) = sin(x)/x with the limit sinc(0) = 1.
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-10 {
+        1.0
+    } else {
+        x.sin() / x
+    }
+}
 
 /// Compute B = A^T * A for an n×n matrix stored as Vec<Vec<f64>>.
 fn mat_transpose_times_mat(a: &[Vec<f64>], n: usize) -> Vec<Vec<f64>> {
@@ -611,5 +882,18 @@ mod tests {
             (norm_sq - 1.0).abs() < 0.01,
             "JSA should be normalised to ~1"
         );
+    }
+
+    #[test]
+    fn test_sinc_zero() {
+        assert!((sinc(0.0) - 1.0).abs() < 1e-15, "sinc(0) = 1");
+        assert!((sinc(1e-12) - 1.0).abs() < 1e-10, "sinc(near-0) ≈ 1");
+    }
+
+    #[test]
+    fn test_sinc_at_pi() {
+        // sinc(π) = sin(π)/π ≈ 0
+        let v = sinc(PI);
+        assert!(v.abs() < 1e-14, "sinc(π) ≈ 0, got {v}");
     }
 }

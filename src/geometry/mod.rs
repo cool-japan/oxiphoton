@@ -10,7 +10,9 @@ pub use csg::{
     df_blend, df_difference, df_intersection, df_smooth_union, df_union, sdf_grid_from_shape,
     voxelize, Box3d, CsgDifference, CsgIntersection, CsgUnion, Cylinder, Sdf, Sphere,
 };
-pub use gds::{GdsCell, GdsLayer, GdsLibrary, GdsPoint, GdsSref, GdsWriter};
+pub use gds::{
+    GdsCell, GdsLayer, GdsLibrary, GdsParseError, GdsPoint, GdsReader, GdsSref, GdsWriter,
+};
 pub use grid::{GridSpec1d, GridSpec2d, GridSpec3d, YeeCellHelper1d};
 pub use mesh::{
     aspect_ratio, longest_edge_midpoint, skewness, Aabb2d, Bvh2d, BvhNode, MeshQualityReport,

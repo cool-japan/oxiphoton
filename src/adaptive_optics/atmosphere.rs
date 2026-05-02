@@ -200,7 +200,7 @@ impl AtmosphericTurbulence {
     /// # Arguments
     /// * `n_modes` — number of Zernike modes corrected (clamped to table size)
     pub fn noll_variance(&self, n_modes: usize) -> f64 {
-        let idx = n_modes.min(NOLL_COEFFICIENTS.len() - 1).max(0);
+        let idx = n_modes.min(NOLL_COEFFICIENTS.len() - 1);
         // Return coefficient (caller multiplies by (D/r₀)^(5/3)).
         NOLL_COEFFICIENTS[idx]
     }

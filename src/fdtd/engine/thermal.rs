@@ -217,7 +217,13 @@ impl ThermalFdtd3d {
 /// # Boundary conditions
 /// * Interior: standard six-neighbour Laplacian stencil.
 /// * Domain boundary: Newton convection  `q = h (T − T_ambient)` modelled as a
-///   flux correction.  Set `convection_coefficient = 0` for adiabatic (Neumann).
+///   Robin BC (ghost-cell elimination).  Set `convection_coefficient = 0` for
+///   adiabatic (Neumann) boundaries.
+///
+/// The Robin BC stability constraint is independent of the Laplacian CFL:
+///   dt < ρ c_p · ds / (2 · h)
+/// where `ds` is the grid spacing perpendicular to the face and `ρ c_p` is the
+/// volumetric heat capacity at the face cell.
 #[derive(Debug, Clone)]
 pub struct HeatSolver3d {
     pub nx: usize,
@@ -236,7 +242,12 @@ pub struct HeatSolver3d {
     /// Typical values: Si ≈ 8.8e-5, SiO₂ ≈ 8.3e-7, air ≈ 2.1e-5.
     pub thermal_diffusivity: Vec<f64>,
 
-    /// Volumetric heat source Q(x,y,z) in W/m³.
+    /// Volumetric heat capacity ρ·c_p (x,y,z) in J/(m³·K) per cell.
+    /// Default: 1.0e6 J/(m³·K) (approximately water-like).
+    /// Used by the Robin convective BC to convert surface flux to temperature rate.
+    pub volumetric_heat_capacity: Vec<f64>,
+
+    /// Volumetric heat source Q(x,y,z) already divided by ρ c_p, in K/s per cell.
     pub heat_source: Vec<f64>,
 
     /// Ambient temperature for convective BC (K).
@@ -252,6 +263,8 @@ impl HeatSolver3d {
     ///
     /// Default thermal diffusivity is that of air (~2.1e-5 m²/s); override
     /// material regions with \[`set_diffusivity_region`\].
+    /// Default volumetric heat capacity is 1.0e6 J/(m³·K); override with
+    /// \[`set_rho_cp_region`\].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         nx: usize,
@@ -266,6 +279,8 @@ impl HeatSolver3d {
         let n = nx * ny * nz;
         // Default diffusivity: air
         let alpha_air = 2.1e-5_f64;
+        // Default ρ·c_p: ~water-like (1e6 J/(m³·K))
+        let rho_cp_default = 1.0e6_f64;
         Self {
             nx,
             ny,
@@ -276,10 +291,58 @@ impl HeatSolver3d {
             dt,
             temperature: vec![ambient_temp; n],
             thermal_diffusivity: vec![alpha_air; n],
+            volumetric_heat_capacity: vec![rho_cp_default; n],
             heat_source: vec![0.0; n],
             ambient_temperature: ambient_temp,
             convection_coefficient: 0.0,
         }
+    }
+
+    /// Create a 3D thermal grid pre-configured for silicon.
+    ///
+    /// α_Si ≈ 8.8e-5 m²/s (α = k/(ρ·c_p) = 148 / (2330 × 712))
+    /// ρ·c_p_Si ≈ 1.66e6 J/(m³·K)
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_silicon(
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        dt: f64,
+        ambient_temp: f64,
+    ) -> Self {
+        let mut sim = Self::new(nx, ny, nz, dx, dy, dz, dt, ambient_temp);
+        let n = nx * ny * nz;
+        let alpha_si = 8.8e-5_f64;
+        let rho_cp_si = 1.66e6_f64;
+        sim.thermal_diffusivity = vec![alpha_si; n];
+        sim.volumetric_heat_capacity = vec![rho_cp_si; n];
+        sim
+    }
+
+    /// Create a 3D thermal grid pre-configured for copper.
+    ///
+    /// α_Cu ≈ 1.17e-4 m²/s; ρ·c_p_Cu ≈ 3.44e6 J/(m³·K)
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_copper(
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+        dt: f64,
+        ambient_temp: f64,
+    ) -> Self {
+        let mut sim = Self::new(nx, ny, nz, dx, dy, dz, dt, ambient_temp);
+        let n = nx * ny * nz;
+        let alpha_cu = 1.17e-4_f64;
+        let rho_cp_cu = 3.44e6_f64;
+        sim.thermal_diffusivity = vec![alpha_cu; n];
+        sim.volumetric_heat_capacity = vec![rho_cp_cu; n];
+        sim
     }
 
     /// Linear index for cell (i, j, k).
@@ -317,8 +380,15 @@ impl HeatSolver3d {
     ///   T_new\[i,j,k\] = T\[i,j,k\] + dt · (α\[i,j,k\] · ∇²T + Q\[i,j,k\])
     ///
     /// The heat source array is assumed to already carry the 1/(ρ c_p) factor.
+    ///
+    /// # Stability constraints
+    ///
+    /// **Laplacian CFL**: `dt < min(dx², dy², dz²) / (6 · α_max)`.
+    ///
+    /// **Robin BC CFL** (when `convection_coefficient > 0`):
+    /// `dt < ρ·c_p · ds / (2 · h)` for each face, where `ds` is the grid
+    /// spacing perpendicular to that face and `h` is the convection coefficient.
     pub fn step(&mut self) {
-        let n = self.nx * self.ny * self.nz;
         // Work on a copy so updates don't pollute the stencil within this step
         let t_old = self.temperature.clone();
         let mut t_new = t_old.clone();
@@ -335,34 +405,60 @@ impl HeatSolver3d {
             }
         }
 
-        // Apply Newton convection BC on the six faces (if h > 0)
+        // Apply Newton/Robin convective BC on the six axis-aligned faces.
+        // Discretized form (explicit forward Euler, ghost-cell elimination):
+        //   ΔT[face] = -2 · h · dt · (T_old[face] - T_amb) / (ρ·c_p[face] · ds)
+        // Stability constraint: dt < ρ·c_p · ds / (2·h).
         if self.convection_coefficient > 0.0 {
             let h = self.convection_coefficient;
             let t_amb = self.ambient_temperature;
-            // Approximate surface correction: scale boundary cells toward ambient
-            // flux = h*(T - T_amb); correction ΔT = -h*(T - T_amb)*dt/(ρ c_p * dx)
-            // Here we lump ρ c_p into the diffusivity for simplicity.
-            let apply_face =
-                |t_new: &mut [f64], alpha: &[f64], nx: usize, ny: usize, nz: usize, dt: f64| {
-                    let correction = |t_face: f64, alpha_local: f64, ds: f64| -> f64 {
-                        if alpha_local.abs() < 1e-30 || ds.abs() < 1e-30 {
-                            return 0.0;
-                        }
-                        -h * (t_face - t_amb) * dt * alpha_local / (ds * ds)
-                    };
-                    // Face i=0, i=nx-1
-                    for j in 0..ny {
-                        for k in 0..nz {
-                            let i0 = j * nz + k;
-                            let i1 = (nx - 1) * ny * nz + j * nz + k;
-                            t_new[i0] += correction(t_new[i0], alpha[i0], 1.0); // dummy ds
-                            t_new[i1] += correction(t_new[i1], alpha[i1], 1.0);
-                        }
+            let dt = self.dt;
+
+            // Face perpendicular to X (i=0 and i=nx-1)
+            for j in 0..self.ny {
+                for k in 0..self.nz {
+                    let i0 = self.idx(0, j, k);
+                    let i1 = self.idx(self.nx - 1, j, k);
+                    let rcp0 = self.volumetric_heat_capacity[i0];
+                    let rcp1 = self.volumetric_heat_capacity[i1];
+                    if rcp0 > 1e-30 {
+                        t_new[i0] += -2.0 * h * dt * (t_old[i0] - t_amb) / (rcp0 * self.dx);
                     }
-                };
-            // Simplified: we just nudge boundary cells — a full implementation
-            // would use the actual grid spacing for each face.
-            let _ = (n, apply_face); // suppress unused warning
+                    if rcp1 > 1e-30 {
+                        t_new[i1] += -2.0 * h * dt * (t_old[i1] - t_amb) / (rcp1 * self.dx);
+                    }
+                }
+            }
+            // Face perpendicular to Y (j=0 and j=ny-1)
+            for i in 0..self.nx {
+                for k in 0..self.nz {
+                    let j0 = self.idx(i, 0, k);
+                    let j1 = self.idx(i, self.ny - 1, k);
+                    let rcp0 = self.volumetric_heat_capacity[j0];
+                    let rcp1 = self.volumetric_heat_capacity[j1];
+                    if rcp0 > 1e-30 {
+                        t_new[j0] += -2.0 * h * dt * (t_old[j0] - t_amb) / (rcp0 * self.dy);
+                    }
+                    if rcp1 > 1e-30 {
+                        t_new[j1] += -2.0 * h * dt * (t_old[j1] - t_amb) / (rcp1 * self.dy);
+                    }
+                }
+            }
+            // Face perpendicular to Z (k=0 and k=nz-1)
+            for i in 0..self.nx {
+                for j in 0..self.ny {
+                    let k0 = self.idx(i, j, 0);
+                    let k1 = self.idx(i, j, self.nz - 1);
+                    let rcp0 = self.volumetric_heat_capacity[k0];
+                    let rcp1 = self.volumetric_heat_capacity[k1];
+                    if rcp0 > 1e-30 {
+                        t_new[k0] += -2.0 * h * dt * (t_old[k0] - t_amb) / (rcp0 * self.dz);
+                    }
+                    if rcp1 > 1e-30 {
+                        t_new[k1] += -2.0 * h * dt * (t_old[k1] - t_amb) / (rcp1 * self.dz);
+                    }
+                }
+            }
         }
 
         self.temperature = t_new;
@@ -402,6 +498,31 @@ impl HeatSolver3d {
                 for k in k0..k1.min(self.nz) {
                     let idx = self.idx(i, j, k);
                     self.thermal_diffusivity[idx] = alpha;
+                }
+            }
+        }
+    }
+
+    /// Set volumetric heat capacity ρ·c_p for all cells inside
+    /// [i0,i1) × [j0,j1) × [k0,k1).
+    ///
+    /// Units: J/(m³·K).  Typical values: Si ≈ 1.66e6, Cu ≈ 3.44e6, air ≈ 1.2e3.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_rho_cp_region(
+        &mut self,
+        i0: usize,
+        i1: usize,
+        j0: usize,
+        j1: usize,
+        k0: usize,
+        k1: usize,
+        rho_cp: f64,
+    ) {
+        for i in i0..i1.min(self.nx) {
+            for j in j0..j1.min(self.ny) {
+                for k in k0..k1.min(self.nz) {
+                    let idx = self.idx(i, j, k);
+                    self.volumetric_heat_capacity[idx] = rho_cp;
                 }
             }
         }

@@ -16,6 +16,15 @@ pub enum OxiPhotonError {
 
     #[error("Numerical error: {0}")]
     NumericalError(String),
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("GDSII parse error: {0}")]
+    Gds(String),
+
+    #[error("Convergence error: {0}")]
+    Convergence(String),
 }
 
 pub type Result<T> = std::result::Result<T, OxiPhotonError>;

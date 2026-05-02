@@ -22,6 +22,8 @@ pub struct WaveguideBend {
     pub n_eff: f64,
     /// Group index (for dispersion)
     pub n_g: f64,
+    /// Core material refractive index (e.g. 3.48 for Si, 2.0 for SiN)
+    pub n_core: f64,
     /// Cladding refractive index
     pub n_clad: f64,
     /// Equivalent slab core width (m) for loss estimate
@@ -31,10 +33,18 @@ pub struct WaveguideBend {
 }
 
 impl WaveguideBend {
-    pub fn new(n_eff: f64, n_g: f64, n_clad: f64, core_width: f64, wavelength: f64) -> Self {
+    pub fn new(
+        n_eff: f64,
+        n_g: f64,
+        n_core: f64,
+        n_clad: f64,
+        core_width: f64,
+        wavelength: f64,
+    ) -> Self {
         Self {
             n_eff,
             n_g,
+            n_core,
             n_clad,
             core_width,
             wavelength,
@@ -46,6 +56,7 @@ impl WaveguideBend {
         Self {
             n_eff: 2.44,
             n_g: 4.18,
+            n_core: 3.48,
             n_clad: 1.444,
             core_width: 500e-9,
             wavelength: 1550e-9,
@@ -71,32 +82,73 @@ impl WaveguideBend {
         k0 * dn * 2.0 * PI * radius
     }
 
-    /// Radiation loss coefficient α_bend (dB per 90° turn) using the
-    /// exponential approximation:
+    /// Returns `(kappa_x, beta, gamma, a)` for the Marcuse 1971 formula.
     ///
-    ///   α_bend ≈ A · exp(-B · R)
+    /// - `kappa_x`: transverse wavenumber inside core [rad/m]
+    /// - `beta`: longitudinal propagation constant [rad/m]
+    /// - `gamma`: transverse decay constant in cladding [rad/m]
+    /// - `a`: half core width [m]
     ///
-    /// where A, B are calibrated for SOI strip waveguides.
-    /// Based on analytical derivation for weakly-guided slab:
-    ///   B = 2 · Re(κ_clad) where κ_clad = sqrt(k₀²·n_clad² - β²) guides
-    ///   the exponential decay into cladding.
-    pub fn bend_loss_db_per_90deg(&self, radius: f64) -> f64 {
+    /// Stability: `gamma` is clamped to `1 / (100 · core_width)` near cutoff to
+    /// avoid divide-by-zero. When `kappa_x = 0` (n_eff ≥ n_core, unphysical),
+    /// the caller returns `f64::INFINITY`.
+    fn mode_parameters(&self) -> (f64, f64, f64, f64) {
         let k0 = 2.0 * PI / self.wavelength;
         let beta = k0 * self.n_eff;
-        let kc_sq = beta * beta - k0 * k0 * self.n_clad * self.n_clad;
-        if kc_sq <= 0.0 {
-            return 0.0; // no guidance → unlimited loss (guided mode doesn't exist)
+
+        let kappa_x_sq = k0 * k0 * self.n_core * self.n_core - beta * beta;
+        let kappa_x = if kappa_x_sq > 0.0 {
+            kappa_x_sq.sqrt()
+        } else {
+            0.0
+        };
+
+        let gamma_sq = beta * beta - k0 * k0 * self.n_clad * self.n_clad;
+        let gamma_min = 1.0 / (100.0 * self.core_width);
+        let gamma = if gamma_sq > 0.0 {
+            gamma_sq.sqrt().max(gamma_min)
+        } else {
+            gamma_min
+        };
+
+        let a = self.core_width / 2.0;
+        (kappa_x, beta, gamma, a)
+    }
+
+    /// Bend loss for a 90° arc using the Marcuse 1971 conformal-transformation formula.
+    ///
+    /// Reference: D. Marcuse, "Bending Losses of the Asymmetric Slab Waveguide,"
+    /// Bell Syst. Tech. J. 50(8), 2551–2563 (1971), Eq. 26.
+    ///
+    /// This is a first-order slab (2D) approximation. For full 3D ridge/strip
+    /// accuracy a complete mode-solver is needed.
+    ///
+    /// Stability: near cutoff (n_eff ≈ n_clad), γ is clamped to `1/(100·core_width)`
+    /// to avoid divergence. When κ_x = 0 (n_eff ≥ n_core, unphysical for bound mode),
+    /// returns `f64::INFINITY`.
+    pub fn bend_loss_db_per_90deg(&self, bend_radius_m: f64) -> f64 {
+        let (kappa_x, beta, gamma, a) = self.mode_parameters();
+
+        // Guard: kappa_x = 0 means n_eff >= n_core (unphysical for guided mode)
+        if kappa_x == 0.0 {
+            return f64::INFINITY;
         }
-        let kc = kc_sq.sqrt();
-        // Loss exponent: B = kc (simplified from full Bessel-function formula)
-        // Pre-factor A calibrated to give ~0.1 dB/turn at R=5μm for SOI
-        let b = kc;
-        let a_db = 10.0 * (b / k0).ln(); // rough pre-factor in dB units
-                                         // α_bend per 90° = A · exp(-B·R) · π·R/2
-                                         // Simplified: exponential decay
-        let alpha_per_length = 4.343 * a_db.exp() * (-b * radius).exp() / self.core_width;
-        // Convert to dB per 90° bend (quarter circle = π·R/2 length)
-        alpha_per_length * PI * radius / 2.0
+
+        // Marcuse 1971 bend loss coefficient [Np/m]
+        let prefactor = (kappa_x * kappa_x) / (beta * gamma * (1.0 + gamma * a));
+        let exp_evanescent = (2.0 * gamma * a).exp();
+        let cubic_exp_arg = -(2.0 / 3.0) * (gamma.powi(3) / beta.powi(2)) * bend_radius_m;
+        // Guard against underflow: exp(-x) ≈ 0 for x > 745 (f64 min_positive)
+        let cubic_exp = if cubic_exp_arg < -745.0 {
+            0.0
+        } else {
+            cubic_exp_arg.exp()
+        };
+
+        let alpha_bend_npm = prefactor * exp_evanescent * cubic_exp;
+
+        // Convert to dB/90°: multiply by arc length (π·R/2), convert Np→dB
+        alpha_bend_npm * (PI * bend_radius_m / 2.0) * 10.0 / std::f64::consts::LN_10
     }
 
     /// Bend loss in dB/turn (full 360°) for a ring of radius R.

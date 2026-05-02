@@ -551,9 +551,7 @@ fn update_h_3d(
     dz: f64,
 ) {
     use crate::units::conversion::MU_0;
-    let coeff_x = dt / (MU_0 * dx);
-    let coeff_y = dt / (MU_0 * dy);
-    let coeff_z = dt / (MU_0 * dz);
+    let coeff = dt / MU_0;
 
     for i in 0..nx {
         for j in 0..ny {
@@ -570,12 +568,9 @@ fn update_h_3d(
                 let dey_dx = (ey[ip1 * ny * nz + j * nz + k] - ey[idx]) / dx;
                 let dex_dy = (ex[i * ny * nz + jp1 * nz + k] - ex[idx]) / dy;
 
-                hx[idx] -= (dez_dy - dey_dz) * coeff_y.min(coeff_z);
-                hy[idx] -= (dex_dz - dez_dx) * coeff_x.min(coeff_z);
-                hz[idx] -= (dey_dx - dex_dy) * coeff_x.min(coeff_y);
-
-                // Suppress unused variable warnings from intermediate values
-                let _ = (dez_dy, dey_dz, dex_dz, dez_dx, dey_dx, dex_dy);
+                hx[idx] -= (dez_dy - dey_dz) * coeff;
+                hy[idx] -= (dex_dz - dez_dx) * coeff;
+                hz[idx] -= (dey_dx - dex_dy) * coeff;
             }
         }
     }

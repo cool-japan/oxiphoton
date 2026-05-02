@@ -12,6 +12,6 @@ pub mod propagation;
 
 pub use grating::{
     DammannGrating, DiffractionGrating, GratingSpectrometer, GratingType, HolographicGrating,
-    VolumeBraggGrating,
+    VolumeBraggGrating, VolumeGrating,
 };
 pub use propagation::{DiffractiveLens, DiffractiveLensType, ScalarDiffraction, SlmHologram};

@@ -97,6 +97,9 @@ impl DesignRegion {
     }
 }
 
+// 3-D types (DesignRegion3d, AdjointSolver3d, VectorField3d, etc.) live in adjoint_3d.rs.
+// Re-exports are provided via src/inverse/mod.rs.
+
 /// Gradient of the figure of merit (FOM) with respect to each design pixel.
 #[derive(Debug, Clone)]
 pub struct FomGradient {
@@ -240,315 +243,587 @@ impl AdjointSolver {
     }
 }
 
-/// A single design variable mapping a physical parameter to a normalised
-/// optimisation variable ρ ∈ \[0, 1\].
+// ─────────────────────────────────────────────────────────────────────────────
+// AdjointSolver2d — wraps Fdtd2dTm for 2D adjoint forward simulation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// FDTD-backed 2D TM adjoint solver.
 ///
-/// Supports any scalar field (permittivity, conductivity, geometry parameter)
-/// with optional upper/lower bounds and a projection function.
-#[derive(Debug, Clone)]
-pub struct DesignVariable {
-    /// Physical identifier (e.g. "eps", "sigma", "width_nm")
-    pub name: String,
-    /// Normalised design variable ρ ∈ \[0, 1\]
-    pub rho: f64,
-    /// Lower bound of physical parameter
-    pub p_min: f64,
-    /// Upper bound of physical parameter
-    pub p_max: f64,
-    /// Gradient of FOM with respect to this variable (filled after adjoint run)
-    pub gradient: f64,
+/// Runs a real 2D TM FDTD simulation and returns the complex E_z field at a
+/// given frequency, accumulated via a running DFT over the simulation duration.
+/// Used by `AdjointOptimizer::compute_forward_field` when `use_fdtd_forward` is `true`.
+pub struct AdjointSolver2d {
+    /// Design-region width in pixels
+    pub nx: usize,
+    /// Design-region height in pixels
+    pub nz: usize,
+    /// Pixel size (m)
+    pub dx: f64,
+    /// Time step (s) — computed from dx via Courant condition when the FDTD grid is built
+    pub dt: f64,
+    /// Number of FDTD time steps to run per forward simulation
+    pub n_steps: usize,
 }
 
-impl DesignVariable {
-    /// Construct a design variable.
-    pub fn new(name: impl Into<String>, rho: f64, p_min: f64, p_max: f64) -> Self {
+impl AdjointSolver2d {
+    /// Guard-band thickness (cells) surrounding the design region.
+    /// The source is placed at the boundary of the guard band, and PML cells
+    /// absorb outgoing energy at the outer grid edge.
+    const GUARD: usize = 5;
+    /// PML thickness (cells)
+    const PML: usize = 10;
+
+    /// Construct a new adjoint solver for a design region of size `nx × nz`.
+    ///
+    /// `dx` is the cell size in metres (same for both axes — square grid).
+    /// Default step count is 2000, which covers ≈ 8 light-crossings for a
+    /// 200-cell grid at dx = 10 nm.
+    pub fn new(nx: usize, nz: usize, dx: f64) -> Self {
+        // Estimate dt from 2D Courant condition: dt = 0.99·dx/(c·√2)
+        use crate::fdtd::config::{Dimensions, GridSpacing};
+        use crate::fdtd::courant::courant_dt;
+        let spacing = GridSpacing { dx, dy: dx, dz: dx };
+        let total_nx = nx + 2 * Self::GUARD + 2 * Self::PML;
+        let total_ny = nz + 2 * Self::GUARD + 2 * Self::PML;
+        let dt = 0.99
+            * courant_dt(
+                Dimensions::TwoD {
+                    nx: total_nx,
+                    ny: total_ny,
+                },
+                spacing,
+                1.0,
+            );
         Self {
-            name: name.into(),
-            rho: rho.clamp(0.0, 1.0),
-            p_min,
-            p_max,
-            gradient: 0.0,
+            nx,
+            nz,
+            dx,
+            dt,
+            n_steps: 2000,
         }
     }
 
-    /// Physical value: p = p_min + ρ·(p_max − p_min).
-    pub fn physical_value(&self) -> f64 {
-        self.p_min + self.rho * (self.p_max - self.p_min)
+    /// Override the number of time steps.
+    pub fn set_fdtd_steps(&mut self, n: usize) {
+        self.n_steps = n;
     }
 
-    /// Update ρ by gradient step (clipped to \[0, 1\]).
-    pub fn step_gradient_ascent(&mut self, step_size: f64) {
-        self.rho = (self.rho + step_size * self.gradient).clamp(0.0, 1.0);
+    /// Run the adjoint FDTD simulation with multi-point adjoint sources.
+    ///
+    /// Each monitor cell `monitor_cells[k]` injects a Gaussian-modulated CW source
+    /// weighted by `fom_dconj_e[k]`.  For complex weight `w = a + ib`:
+    ///
+    ///   src_val = Re(w · exp(iωt)) · gauss(t) = (a·cos(ωt) − b·sin(ωt)) · gauss(t)
+    ///
+    /// This handles complex adjoint weights correctly and reduces to `a·cos(ωt)·gauss(t)`
+    /// for real weights.
+    ///
+    /// After running `n_steps` FDTD steps, the DFT-accumulated E_z field over the
+    /// design region is returned as a flat `Vec<Complex64>` of length
+    /// `region.nx * region.nz` (j-major: index = `j * nx + i`).
+    ///
+    /// # Errors
+    /// Returns `OxiPhotonError::NumericalError` if `monitor_cells.len() !=
+    /// fom_dconj_e.len()`, or if the simulation produces non-finite fields.
+    pub fn run_adjoint(
+        &self,
+        region: &DesignRegion,
+        monitor_cells: &[(usize, usize)],
+        fom_dconj_e: &[num_complex::Complex64],
+        wavelength_m: f64,
+    ) -> Result<Vec<num_complex::Complex64>, crate::error::OxiPhotonError> {
+        use crate::error::OxiPhotonError;
+        use crate::fdtd::config::BoundaryConfig;
+        use crate::fdtd::dims::fdtd_2d::Fdtd2dTm;
+        use num_complex::Complex64;
+        use std::f64::consts::PI;
+
+        if monitor_cells.len() != fom_dconj_e.len() {
+            return Err(OxiPhotonError::NumericalError(format!(
+                "run_adjoint: monitor_cells.len()={} != fom_dconj_e.len()={}",
+                monitor_cells.len(),
+                fom_dconj_e.len()
+            )));
+        }
+
+        if wavelength_m <= 0.0 || !wavelength_m.is_finite() {
+            return Err(OxiPhotonError::InvalidWavelength(wavelength_m));
+        }
+
+        let guard = Self::GUARD;
+        let pml = Self::PML;
+        let dx = self.dx;
+
+        let total_nx = region.nx + 2 * guard + 2 * pml;
+        let total_ny = region.nz + 2 * guard + 2 * pml;
+
+        let bc = BoundaryConfig::pml(pml);
+        let mut sim = Fdtd2dTm::new(total_nx, total_ny, dx, dx, &bc);
+        let dt = sim.dt;
+
+        // Fill permittivity from the design region (same as run_forward)
+        let offset_x = guard + pml;
+        let offset_y = guard + pml;
+        for rj in 0..region.nz {
+            for ri in 0..region.nx {
+                let gi = ri + offset_x;
+                let gj = rj + offset_y;
+                let eps = region.epsilon(ri, rj);
+                let idx = gj * total_nx + gi;
+                if idx < sim.eps_r.len() {
+                    sim.eps_r[idx] = eps;
+                }
+            }
+        }
+
+        // Source parameters: Gaussian-modulated CW (same envelope as run_forward)
+        let c = 2.998e8_f64;
+        let f0 = c / wavelength_m;
+        let sigma = 4.0 / f0;
+        let t0 = 4.0 * sigma;
+        let omega0 = 2.0 * PI * f0;
+
+        // Pre-compute FDTD grid coordinates for each monitor cell
+        let monitor_grid: Vec<(usize, usize)> = monitor_cells
+            .iter()
+            .map(|&(mi, mj)| {
+                let gi = (mi + offset_x).min(total_nx - 1);
+                let gj = (mj + offset_y).min(total_ny - 1);
+                (gi, gj)
+            })
+            .collect();
+
+        // Running DFT accumulators for E_z over the design region
+        let n_cells = region.nx * region.nz;
+        let mut ez_re = vec![0.0_f64; n_cells];
+        let mut ez_im = vec![0.0_f64; n_cells];
+
+        let n_steps = self.n_steps;
+
+        for step in 0..n_steps {
+            let t = step as f64 * dt;
+            let env = (-(t - t0).powi(2) / (2.0 * sigma * sigma)).exp();
+
+            // Inject adjoint source at each monitor cell with complex weight
+            for (k, &(gi, gj)) in monitor_grid.iter().enumerate() {
+                let w = fom_dconj_e[k];
+                // Re(w · exp(iω₀t)) = w.re·cos(ω₀t) − w.im·sin(ω₀t)
+                let carrier = w.re * (omega0 * t).cos() - w.im * (omega0 * t).sin();
+                let src_val = carrier * env;
+                sim.inject_ez(gi, gj, src_val);
+            }
+            sim.step();
+
+            // Accumulate DFT over design region
+            let t_now = sim.current_time();
+            let phase_re = (omega0 * t_now).cos() * dt;
+            let phase_im = -(omega0 * t_now).sin() * dt;
+            for rj in 0..region.nz {
+                for ri in 0..region.nx {
+                    let gi = ri + offset_x;
+                    let gj = rj + offset_y;
+                    let ez_val = if gi < total_nx && gj < total_ny {
+                        sim.ez[gj * total_nx + gi]
+                    } else {
+                        0.0
+                    };
+                    let cell = rj * region.nx + ri;
+                    ez_re[cell] += ez_val * phase_re;
+                    ez_im[cell] += ez_val * phase_im;
+                }
+            }
+        }
+
+        // Check for NaN/Inf
+        for (&re, &im) in ez_re.iter().zip(ez_im.iter()) {
+            if !re.is_finite() || !im.is_finite() {
+                return Err(OxiPhotonError::NumericalError(
+                    "FDTD adjoint simulation produced non-finite fields".to_string(),
+                ));
+            }
+        }
+
+        let result: Vec<Complex64> = ez_re
+            .into_iter()
+            .zip(ez_im)
+            .map(|(re, im)| Complex64::new(re, im))
+            .collect();
+
+        Ok(result)
+    }
+
+    /// Run the forward FDTD simulation and return the complex E_z field at `wavelength_m`
+    /// over the design region.
+    ///
+    /// # Arguments
+    /// * `region`       – design region (supplies permittivity at each pixel)
+    /// * `source_i`     – design-region x-index of the injection point
+    /// * `source_j`     – design-region z/y-index of the injection point
+    /// * `wavelength_m` – free-space wavelength (m)
+    ///
+    /// # Returns
+    /// Flat `Vec<Complex64>` of length `region.nx * region.nz` (row-major, j-major).
+    pub fn run_forward(
+        &self,
+        region: &DesignRegion,
+        source_i: usize,
+        source_j: usize,
+        wavelength_m: f64,
+    ) -> Result<Vec<num_complex::Complex64>, crate::error::OxiPhotonError> {
+        use crate::error::OxiPhotonError;
+        use crate::fdtd::config::BoundaryConfig;
+        use crate::fdtd::dims::fdtd_2d::{DftBox2dTm, Fdtd2dTm};
+        use num_complex::Complex64;
+        use std::f64::consts::PI;
+
+        if wavelength_m <= 0.0 || !wavelength_m.is_finite() {
+            return Err(OxiPhotonError::InvalidWavelength(wavelength_m));
+        }
+
+        let guard = Self::GUARD;
+        let pml = Self::PML;
+        let dx = self.dx;
+
+        // Total FDTD grid dimensions (design region + guard bands + PML)
+        let total_nx = region.nx + 2 * guard + 2 * pml;
+        let total_ny = region.nz + 2 * guard + 2 * pml;
+
+        let bc = BoundaryConfig::pml(pml);
+        let mut sim = Fdtd2dTm::new(total_nx, total_ny, dx, dx, &bc);
+        let dt = sim.dt;
+
+        // Fill permittivity from the design region (offset by guard + pml)
+        let offset_x = guard + pml;
+        let offset_y = guard + pml;
+        for rj in 0..region.nz {
+            for ri in 0..region.nx {
+                let gi = ri + offset_x;
+                let gj = rj + offset_y;
+                let eps = region.epsilon(ri, rj);
+                let idx = gj * total_nx + gi;
+                if idx < sim.eps_r.len() {
+                    sim.eps_r[idx] = eps;
+                }
+            }
+        }
+
+        // Source parameters: Gaussian-modulated CW (quasi-monochromatic)
+        let c = 2.998e8_f64;
+        let f0 = c / wavelength_m;
+        let sigma = 4.0 / f0; // temporal Gaussian width (4 cycles)
+        let t0 = 4.0 * sigma; // centre of Gaussian envelope
+
+        // DFT monitor over the design region cells
+        let dft = DftBox2dTm::new(&[f0], region.nx, region.nz, dt);
+        // We accumulate manually to handle the region offset
+
+        // Running DFT accumulators for the design region E_z only
+        let n_cells = region.nx * region.nz;
+        let mut ez_re = vec![0.0_f64; n_cells];
+        let mut ez_im = vec![0.0_f64; n_cells];
+
+        // Source cell in FDTD grid coordinates
+        let src_gi = (source_i + offset_x).min(total_nx - 1);
+        let src_gj = (source_j + offset_y).min(total_ny - 1);
+
+        let n_steps = self.n_steps;
+        let omega0 = 2.0 * PI * f0;
+
+        // Drop the unused dft binding; we accumulate manually
+        let _ = dft;
+
+        for step in 0..n_steps {
+            let t = step as f64 * dt;
+            // Gaussian-modulated sinusoidal source
+            let env = (-(t - t0).powi(2) / (2.0 * sigma * sigma)).exp();
+            let src_val = (omega0 * t).sin() * env;
+            sim.inject_ez(src_gi, src_gj, src_val);
+            sim.step();
+
+            // Accumulate DFT over design region
+            let t_now = sim.current_time();
+            let phase_re = (omega0 * t_now).cos() * dt;
+            let phase_im = -(omega0 * t_now).sin() * dt;
+            for rj in 0..region.nz {
+                for ri in 0..region.nx {
+                    let gi = ri + offset_x;
+                    let gj = rj + offset_y;
+                    let ez_val = if gi < total_nx && gj < total_ny {
+                        sim.ez[gj * total_nx + gi]
+                    } else {
+                        0.0
+                    };
+                    let cell = rj * region.nx + ri;
+                    ez_re[cell] += ez_val * phase_re;
+                    ez_im[cell] += ez_val * phase_im;
+                }
+            }
+        }
+
+        // Check for NaN/Inf in result
+        for (&re, &im) in ez_re.iter().zip(ez_im.iter()) {
+            if !re.is_finite() || !im.is_finite() {
+                return Err(OxiPhotonError::NumericalError(
+                    "FDTD forward simulation produced non-finite fields".to_string(),
+                ));
+            }
+        }
+
+        let result: Vec<Complex64> = ez_re
+            .into_iter()
+            .zip(ez_im)
+            .map(|(re, im)| Complex64::new(re, im))
+            .collect();
+
+        Ok(result)
     }
 }
 
-/// 3D adjoint sensitivity solver.
+// ─────────────────────────────────────────────────────────────────────────────
+// AdjointOptimizer — 2D TM adjoint optimizer wiring FDTD forward field
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 2D adjoint optimizer that uses a real FDTD simulation for the forward field.
 ///
-/// Wraps an FDTD-like structure (represented by permittivity grids) and
-/// provides the forward / adjoint field computation framework needed for
-/// gradient-based topology optimisation.
+/// This struct coordinates:
+///   1. Forward simulation: `compute_forward_field` runs `Fdtd2dTm` and
+///      extracts the complex E_z via a running DFT.
+///   2. Adjoint simulation: `compute_adjoint_field` uses the same
+///      FDTD approach driven by the adjoint source (conj(E_fwd) at monitor).
+///   3. Gradient assembly: `compute_gradient` evaluates
+///      dFOM/dρ = -Re[E_fwd · conj(E_adj)] × (ε_max - ε_min).
 ///
-/// In a full FDTD-coupled implementation the forward and adjoint runs would
-/// drive the actual `Fdtd3d` engine.  Here we implement the complete
-/// mathematical infrastructure: field storage, gradient computation, design
-/// variable management, and optimisation loops.
-pub struct AdjointSolver3d {
-    /// Grid extents
-    pub nx: usize,
-    pub ny: usize,
-    pub nz: usize,
-    /// Cell size (uniform, m)
-    pub dx: f64,
-    /// Angular frequency (rad/s)
-    pub omega: f64,
-    /// Design variable list (parameter per cell in design region)
-    pub variables: Vec<DesignVariable>,
-    /// Forward field (Ez component, complex \[re, im\] per cell)
-    pub e_fwd: Vec<[f64; 2]>,
-    /// Adjoint field (Ez component, complex \[re, im\] per cell)
-    pub e_adj: Vec<[f64; 2]>,
-    /// Computed gradient ∂FOM/∂ρ_i for each design variable
-    pub gradient: Vec<f64>,
-    /// Iteration history: (iteration, FOM)
-    pub history: Vec<(usize, f64)>,
-    /// Current FOM value
-    pub fom: f64,
+/// When `use_fdtd_forward = false`, the forward field falls back to a fast
+/// analytic Gaussian × plane-wave estimate (`compute_forward_field_analytic`).
+pub struct AdjointOptimizer {
+    /// Operating wavelength (m)
+    pub wavelength: f64,
+    /// Design region
+    pub region: DesignRegion,
+    /// If true, use FDTD for the forward field; otherwise use analytic estimate
+    pub use_fdtd_forward: bool,
+    /// 2D FDTD adjoint solver
+    pub fdtd_solver: AdjointSolver2d,
+    /// Source injection x-index within the design region
+    pub source_i: usize,
+    /// Source injection z/y-index within the design region
+    pub source_j: usize,
+    /// Monitor cell positions (design-region coordinates) for the adjoint sources.
+    ///
+    /// Each `(i, j)` is a design-region pixel index; the adjoint field is driven
+    /// by weighted sources at these locations.
+    pub monitor_cells: Vec<(usize, usize)>,
+    /// Optimisation step size (learning rate)
+    pub step_size: f64,
     /// Iteration counter
     pub iteration: usize,
 }
 
-impl AdjointSolver3d {
-    /// Create a new 3D adjoint solver.
+impl AdjointOptimizer {
+    /// Create an `AdjointOptimizer` for the given design region and wavelength.
     ///
-    /// # Arguments
-    /// * `nx, ny, nz` – grid dimensions
-    /// * `dx`         – uniform cell size (m)
-    /// * `omega`      – angular frequency ω = 2πc/λ (rad/s)
-    pub fn new(nx: usize, ny: usize, nz: usize, dx: f64, omega: f64) -> Self {
-        let n = nx * ny * nz;
+    /// By default the FDTD forward field is enabled (`use_fdtd_forward = true`).
+    /// The source is placed at the centre of the design region's left edge.
+    /// `monitor_cells` is the list of design-region pixel coordinates `(i, j)`
+    /// used as adjoint source locations; pass `vec![]` for an empty initial list.
+    pub fn new(region: DesignRegion, wavelength: f64, monitor_cells: Vec<(usize, usize)>) -> Self {
+        let fdtd_solver = AdjointSolver2d::new(region.nx, region.nz, region.dx);
+        let source_i = 0;
+        let source_j = region.nz / 2;
         Self {
-            nx,
-            ny,
-            nz,
-            dx,
-            omega,
-            variables: Vec::new(),
-            e_fwd: vec![[0.0, 0.0]; n],
-            e_adj: vec![[0.0, 0.0]; n],
-            gradient: Vec::new(),
-            history: Vec::new(),
-            fom: 0.0,
+            wavelength,
+            region,
+            use_fdtd_forward: true,
+            fdtd_solver,
+            source_i,
+            source_j,
+            monitor_cells,
+            step_size: 0.01,
             iteration: 0,
         }
     }
 
-    /// SOI-waveguide optimisation problem (220 nm height, Si/SiO₂).
-    pub fn soi(nx: usize, ny: usize, nz: usize, resolution_nm: f64) -> Self {
-        use std::f64::consts::PI;
-        let c = 2.998e8_f64;
-        let lambda = 1550e-9_f64;
-        let omega = 2.0 * PI * c / lambda;
-        Self::new(nx, ny, nz, resolution_nm * 1e-9, omega)
-    }
-
-    /// Add a design variable for the cell at (i, j, k).
-    pub fn add_variable(&mut self, i: usize, j: usize, k: usize, eps_min: f64, eps_max: f64) {
-        let name = format!("eps_{i}_{j}_{k}");
-        self.variables
-            .push(DesignVariable::new(name, 0.5, eps_min, eps_max));
-        self.gradient.push(0.0);
-    }
-
-    /// Fill design variables for a rectangular region with ρ = 0.5.
-    #[allow(clippy::too_many_arguments)]
-    pub fn fill_design_region(
-        &mut self,
-        i0: usize,
-        i1: usize,
-        j0: usize,
-        j1: usize,
-        k0: usize,
-        k1: usize,
-        eps_min: f64,
-        eps_max: f64,
-    ) {
-        for k in k0..k1 {
-            for j in j0..j1 {
-                for i in i0..i1 {
-                    self.add_variable(i, j, k, eps_min, eps_max);
-                }
-            }
-        }
-    }
-
-    /// Simulate the "forward" run — in a full implementation this calls FDTD.
+    /// Compute the forward E_z field over the design region.
     ///
-    /// Here we populate `e_fwd` with a simplified Gaussian mode estimate
-    /// centred on the design region, to provide a meaningful gradient when
-    /// chained with `compute_adjoint_field` and `compute_gradient`.
-    pub fn compute_forward_field(&mut self) {
-        let nx = self.nx;
-        let ny = self.ny;
-        let nz = self.nz;
-        let xc = nx as f64 / 2.0;
-        let yc = ny as f64 / 2.0;
-        let wx = nx as f64 / 6.0;
-        let wy = ny as f64 / 6.0;
-
-        for k in 0..nz {
-            // Simple plane-wave with Gaussian transverse profile
-            let phase_k = self.omega * k as f64 * self.dx / 2.998e8;
-            let (sin_k, cos_k) = phase_k.sin_cos();
-            for j in 0..ny {
-                let yy = (j as f64 - yc) / wy;
-                for i in 0..nx {
-                    let xx = (i as f64 - xc) / wx;
-                    let env = (-0.5 * (xx * xx + yy * yy)).exp();
-                    let idx = k * (nx * ny) + j * nx + i;
-                    self.e_fwd[idx] = [env * cos_k, env * sin_k];
-                }
-            }
-        }
-        // FOM = integrated |E|² at output plane
-        let k_out = nz.saturating_sub(1);
-        self.fom = (0..nx * ny)
-            .map(|ij| {
-                let idx = k_out * nx * ny + ij;
-                let [re, im] = self.e_fwd[idx];
-                re * re + im * im
-            })
-            .sum::<f64>()
-            * self.dx
-            * self.dx;
-    }
-
-    /// Simulate the "adjoint" run — drives adjoint source at the monitor.
-    ///
-    /// The adjoint source is proportional to conj(E_fwd) at the output
-    /// monitor plane.  Here we propagate a reversed (–z) Gaussian wave
-    /// from the output plane back through the domain.
-    pub fn compute_adjoint_field(&mut self) {
-        let nx = self.nx;
-        let ny = self.ny;
-        let nz = self.nz;
-        let xc = nx as f64 / 2.0;
-        let yc = ny as f64 / 2.0;
-        let wx = nx as f64 / 6.0;
-        let wy = ny as f64 / 6.0;
-
-        for k in 0..nz {
-            let phase_k = self.omega * (nz - 1 - k) as f64 * self.dx / 2.998e8;
-            let (sin_k, cos_k) = phase_k.sin_cos();
-            for j in 0..ny {
-                let yy = (j as f64 - yc) / wy;
-                for i in 0..nx {
-                    let xx = (i as f64 - xc) / wx;
-                    let env = (-0.5 * (xx * xx + yy * yy)).exp();
-                    let idx = k * (nx * ny) + j * nx + i;
-                    // Adjoint source = conj(E_fwd) amplitude backward
-                    self.e_adj[idx] = [env * cos_k, -env * sin_k];
-                }
-            }
-        }
-    }
-
-    /// Compute the gradient ∂FOM/∂ρ_i for each design variable.
-    ///
-    /// Uses the adjoint formula:
-    ///   ∂FOM/∂ρ_i = -2ω²ε₀ · (ε_max - ε_min) · Re\[E_fwd · conj(E_adj)\]_i · V_cell
-    ///
-    /// where V_cell = dx³ is the cell volume.
-    pub fn compute_gradient(&mut self) {
-        let eps0 = 8.854e-12_f64;
-        let omega = self.omega;
-        let dx3 = self.dx * self.dx * self.dx;
-        let nx = self.nx;
-        let ny = self.ny;
-
-        for (var_idx, var) in self.variables.iter().enumerate() {
-            // Extract pixel coordinates from variable name (stored as index into variables)
-            // We rely on the order variables were added via fill_design_region
-            // Each variable corresponds to a unique cell; we use var_idx as proxy
-            let de = var.p_max - var.p_min;
-            // Find the corresponding cell index (variables added in k-j-i order)
-            let cell_idx = var_idx; // 1:1 mapping when fill_design_region used
-            let idx = cell_idx.min(self.e_fwd.len().saturating_sub(1));
-
-            // Map var_idx → (i, j, k) using the design region shape
-            // (assume variables cover a contiguous block starting at some offset)
-            let n_per_k = nx * ny;
-            let k = idx / n_per_k;
-            let ij = idx % n_per_k;
-            let j = ij / nx;
-            let i = ij % nx;
-            let fwd_idx = k * n_per_k + j * nx + i;
-
-            let [ef_re, ef_im] = if fwd_idx < self.e_fwd.len() {
-                self.e_fwd[fwd_idx]
-            } else {
-                [0.0, 0.0]
-            };
-            let [ea_re, ea_im] = if fwd_idx < self.e_adj.len() {
-                self.e_adj[fwd_idx]
-            } else {
-                [0.0, 0.0]
-            };
-
-            // Re[E_fwd · conj(E_adj)]
-            let overlap = ef_re * ea_re + ef_im * ea_im;
-            self.gradient[var_idx] = -2.0 * omega * omega * eps0 * de * overlap * dx3;
-        }
-
-        // Update gradient on each DesignVariable
-        for (var, &g) in self.variables.iter_mut().zip(self.gradient.iter()) {
-            var.gradient = g;
-        }
-    }
-
-    /// Perform one gradient-ascent step and record history.
-    ///
-    /// Runs forward → adjoint → gradient → update in one call.
-    pub fn gradient_step(&mut self, step_size: f64) {
-        self.compute_forward_field();
-        self.compute_adjoint_field();
-        self.compute_gradient();
-
-        for var in &mut self.variables {
-            var.step_gradient_ascent(step_size);
-        }
-
-        self.history.push((self.iteration, self.fom));
-        self.iteration += 1;
-    }
-
-    /// L2 norm of the current gradient vector.
-    pub fn gradient_norm(&self) -> f64 {
-        self.gradient.iter().map(|g| g * g).sum::<f64>().sqrt()
-    }
-
-    /// Number of design variables.
-    pub fn n_variables(&self) -> usize {
-        self.variables.len()
-    }
-
-    /// FOM improvement ratio: latest / initial (from history).
-    pub fn fom_improvement(&self) -> f64 {
-        if self.history.len() < 2 {
-            return 1.0;
-        }
-        let (_, f0) = self.history[0];
-        let (_, f1) = *self.history.last().expect("history non-empty");
-        if f0 == 0.0 {
-            1.0
+    /// Dispatches to the real FDTD simulation when `use_fdtd_forward` is `true`,
+    /// otherwise falls back to the fast analytic estimate.
+    pub fn compute_forward_field(
+        &self,
+    ) -> Result<Vec<num_complex::Complex64>, crate::error::OxiPhotonError> {
+        if self.use_fdtd_forward {
+            self.fdtd_solver.run_forward(
+                &self.region,
+                self.source_i,
+                self.source_j,
+                self.wavelength,
+            )
         } else {
-            f1 / f0
+            self.compute_forward_field_analytic()
         }
+    }
+
+    /// Analytic Gaussian × plane-wave estimate of the forward E_z field.
+    ///
+    /// Provides a quick, approximate forward field for testing without FDTD.
+    /// The field is a Gaussian mode modulated by a plane wave propagating in
+    /// the +z direction (i index), peaked at the source location.
+    pub fn compute_forward_field_analytic(
+        &self,
+    ) -> Result<Vec<num_complex::Complex64>, crate::error::OxiPhotonError> {
+        use num_complex::Complex64;
+        use std::f64::consts::PI;
+
+        let nx = self.region.nx;
+        let nz = self.region.nz;
+        let c = 2.998e8_f64;
+        let f0 = c / self.wavelength;
+        let omega = 2.0 * PI * f0;
+
+        // Gaussian transverse profile centred on source_j
+        let xc = self.source_i as f64;
+        let zc = self.source_j as f64;
+        let wx = (nx as f64 / 6.0).max(1.0);
+        let wz = (nz as f64 / 6.0).max(1.0);
+
+        let mut result = Vec::with_capacity(nx * nz);
+        for rj in 0..nz {
+            // phase increases along propagation (i) direction
+            for ri in 0..nx {
+                let xx = (ri as f64 - xc) / wx;
+                let zz = (rj as f64 - zc) / wz;
+                let env = (-0.5 * (xx * xx + zz * zz)).exp();
+                let phase = omega * ri as f64 * self.region.dx / c;
+                result.push(Complex64::new(env * phase.cos(), env * phase.sin()));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Compute the adjoint E_z field over the design region.
+    ///
+    /// Dispatches to the real FDTD-backed adjoint simulation when
+    /// `use_fdtd_forward` is `true`, otherwise falls back to the fast analytic
+    /// Gaussian-weighted Green's-function approximation.
+    ///
+    /// # Arguments
+    /// * `region`       – design region (supplies permittivity for the FDTD run)
+    /// * `fom_dconj_e`  – ∂FoM/∂E_z* at each monitor cell (complex adjoint weights)
+    ///
+    /// `fom_dconj_e.len()` must equal `self.monitor_cells.len()`.
+    pub fn compute_adjoint_field(
+        &self,
+        region: &DesignRegion,
+        fom_dconj_e: &[num_complex::Complex64],
+    ) -> Result<Vec<num_complex::Complex64>, crate::error::OxiPhotonError> {
+        if self.use_fdtd_forward {
+            self.fdtd_solver
+                .run_adjoint(region, &self.monitor_cells, fom_dconj_e, self.wavelength)
+        } else {
+            self.compute_adjoint_field_analytic(region, fom_dconj_e)
+        }
+    }
+
+    /// Analytic approximation of the adjoint E_z field.
+    ///
+    /// For a uniform-medium approximation, each monitor cell `m` at `(mi_m, mj_m)`
+    /// contributes a Gaussian-decaying field weighted by `fom_dconj_e[m]`:
+    ///
+    ///   `e_adj[j * nx + i]` = Σ_m `fom_dconj_e[m]` · exp(−((i−mi_m)² + (j−mj_m)²) / σ²)
+    ///
+    /// where σ = `region.nx.min(region.nz) as f64 * 0.3`.
+    ///
+    /// Used only when `use_fdtd_forward = false` (unit tests and fast validation).
+    pub fn compute_adjoint_field_analytic(
+        &self,
+        region: &DesignRegion,
+        fom_dconj_e: &[num_complex::Complex64],
+    ) -> Result<Vec<num_complex::Complex64>, crate::error::OxiPhotonError> {
+        use crate::error::OxiPhotonError;
+        use num_complex::Complex64;
+
+        if self.monitor_cells.len() != fom_dconj_e.len() {
+            return Err(OxiPhotonError::NumericalError(format!(
+                "compute_adjoint_field_analytic: monitor_cells.len()={} != fom_dconj_e.len()={}",
+                self.monitor_cells.len(),
+                fom_dconj_e.len()
+            )));
+        }
+
+        let nx = region.nx;
+        let nz = region.nz;
+        let sigma = region.nx.min(region.nz) as f64 * 0.3;
+        let sigma_sq = (sigma * sigma).max(1.0); // guard against zero
+
+        let mut result = vec![Complex64::new(0.0, 0.0); nx * nz];
+
+        for rj in 0..nz {
+            for ri in 0..nx {
+                let cell = rj * nx + ri;
+                let mut acc = Complex64::new(0.0, 0.0);
+                for (m, &(mi_m, mj_m)) in self.monitor_cells.iter().enumerate() {
+                    let di = ri as f64 - mi_m as f64;
+                    let dj = rj as f64 - mj_m as f64;
+                    let decay = (-(di * di + dj * dj) / sigma_sq).exp();
+                    acc += fom_dconj_e[m] * decay;
+                }
+                result[cell] = acc;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Compute the gradient dFOM/dρ using the adjoint method.
+    ///
+    /// FOM = Σ |E_z|² at monitor (here: all design cells, sum of intensities).
+    /// Gradient: dFOM/dρ_i = -2 Re[E_fwd_i · conj(E_adj_i)] × (ε_max - ε_min)
+    ///
+    /// For the amplitude-maximisation FOM the adjoint source equals conj(E_fwd)
+    /// at the monitor, so E_adj ≈ conj(E_fwd) and the gradient simplifies to:
+    ///   dFOM/dρ_i ≈ -2 |E_fwd_i|² × (ε_max - ε_min)
+    /// which is the correct sign for gradient ascent (increasing ε where the
+    /// field is strong).
+    pub fn compute_gradient(
+        &self,
+        e_fwd: &[num_complex::Complex64],
+        e_adj: &[num_complex::Complex64],
+    ) -> Result<crate::error::Result<FomGradient>, crate::error::OxiPhotonError> {
+        let n = self.region.n_params();
+        if e_fwd.len() != n || e_adj.len() != n {
+            return Err(crate::error::OxiPhotonError::NumericalError(format!(
+                "Field length mismatch: e_fwd={}, e_adj={}, n_params={}",
+                e_fwd.len(),
+                e_adj.len(),
+                n
+            )));
+        }
+        let de = self.region.eps_max - self.region.eps_min;
+        let fom: f64 = e_fwd.iter().map(|c| c.norm_sqr()).sum();
+        let grad: Vec<f64> = e_fwd
+            .iter()
+            .zip(e_adj.iter())
+            .map(|(ef, ea)| {
+                // Re[E_fwd · conj(E_adj)]
+                let overlap = ef.re * ea.re + ef.im * ea.im;
+                -2.0 * de * overlap
+            })
+            .collect();
+        Ok(Ok(FomGradient { grad, fom }))
+    }
+
+    /// Update design variables using gradient ascent: ρ ← clip(ρ + α·∇FOM, 0, 1).
+    pub fn update_gradient_ascent(&mut self, gradient: &FomGradient) {
+        for (rho, &g) in self.region.rho.iter_mut().zip(&gradient.grad) {
+            *rho = (*rho + self.step_size * g).clamp(0.0, 1.0);
+        }
+        self.iteration += 1;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inverse::adjoint_3d::{AdjointSolver3d, DesignVariable};
     use std::f64::consts::PI;
 
     #[test]

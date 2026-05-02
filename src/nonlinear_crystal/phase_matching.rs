@@ -29,6 +29,9 @@ pub enum PhaseMatchingType {
     /// Type III: non-collinear / e + e → e (less common label; used for NCPM or
     /// non-collinear geometries).
     TypeIII,
+    /// Type 0: all fields share the same polarization (e.g., e → e + e via d33).
+    /// Requires QPM to satisfy phase matching; common in waveguide PPLN.
+    TypeZero,
     /// Quasi-phase matching (QPM) using periodic domain inversion with given poling period Λ (μm).
     QuasiPm { period_um: f64 },
 }
@@ -101,6 +104,12 @@ impl SHGPhaseMatching {
                 let k1_e = self.k_extraordinary(lambda1, theta_rad);
                 let k2_o = self.k_ordinary(lambda2);
                 k2_o - 2.0 * k1_e
+            }
+            PhaseMatchingType::TypeZero => {
+                // e → e + e: all ordinary (same polarisation, e.g. d33 in PPLN)
+                let k1 = self.k_ordinary(lambda1);
+                let k2 = self.k_ordinary(lambda2);
+                k2 - 2.0 * k1
             }
             PhaseMatchingType::QuasiPm { period_um } => {
                 // Type-I with QPM compensation: Δk_eff = Δk_free - 2π/Λ

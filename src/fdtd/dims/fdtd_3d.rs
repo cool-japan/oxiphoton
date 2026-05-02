@@ -3,6 +3,14 @@ use crate::fdtd::config::{BoundaryConfig, Dimensions, GridSpacing};
 use crate::fdtd::courant::courant_dt;
 use crate::units::conversion::{EPSILON_0, MU_0, SPEED_OF_LIGHT};
 
+/// Parallel H-update result: (idx, hx, hy, hz, psi_hx_y, psi_hx_z, psi_hy_x, psi_hy_z, psi_hz_x, psi_hz_y)
+#[cfg(feature = "parallel")]
+type HUpdateEntry = (usize, f64, f64, f64, f64, f64, f64, f64, f64, f64);
+
+/// Parallel E-update result: (idx, ex, ey, ez, psi_ex_y, psi_ex_z, psi_ey_x, psi_ey_z, psi_ez_x, psi_ez_y)
+#[cfg(feature = "parallel")]
+type EUpdateEntry = (usize, f64, f64, f64, f64, f64, f64, f64, f64, f64);
+
 pub use super::fdtd_3d_ext::{
     Axis3d, Checkpoint3d, CwWaveform3d, DftProbe3d, Fdtd3dMaterial, FieldComponent3d, FieldProbe3d,
     GaussianPulse3d, GaussianWaveform3d, PlaneMonitor3d, SourceType3d, SourceWaveform3d,
@@ -849,6 +857,9 @@ impl Fdtd3d {
             .collect();
 
         // Pre-read immutable field data to avoid borrow issues
+        let hx_snap: Vec<f64> = self.hx.clone();
+        let hy_snap: Vec<f64> = self.hy.clone();
+        let hz_snap: Vec<f64> = self.hz.clone();
         let ex_snap: Vec<f64> = self.ex.clone();
         let ey_snap: Vec<f64> = self.ey.clone();
         let ez_snap: Vec<f64> = self.ez.clone();
@@ -863,9 +874,17 @@ impl Fdtd3d {
         let pml_z_b_h: Vec<f64> = self.pml_z.b_h.clone();
         let pml_z_c_h: Vec<f64> = self.pml_z.c_h.clone();
         let pml_z_kappa_h: Vec<f64> = self.pml_z.kappa_h.clone();
+        // Snapshots of all 6 psi_h fields for correct b*psi_old recursion
+        let psi_hx_y_snap: Vec<f64> = self.psi_hx_y.clone();
+        let psi_hx_z_snap: Vec<f64> = self.psi_hx_z.clone();
+        let psi_hy_x_snap: Vec<f64> = self.psi_hy_x.clone();
+        let psi_hy_z_snap: Vec<f64> = self.psi_hy_z.clone();
+        let psi_hz_x_snap: Vec<f64> = self.psi_hz_x.clone();
+        let psi_hz_y_snap: Vec<f64> = self.psi_hz_y.clone();
 
-        // Compute update deltas in parallel
-        let updates: Vec<(usize, f64, f64, f64, f64, f64, f64)> = cells
+        // Compute full new H and psi values in parallel
+        // Return tuple: (idx, hx_new, hy_new, hz_new, psi_hx_y, psi_hx_z, psi_hy_x, psi_hy_z, psi_hz_x, psi_hz_y)
+        let updates: Vec<HUpdateEntry> = cells
             .par_iter()
             .map(|&(i, j, k)| {
                 let idx = k * (nx * ny) + j * nx + i;
@@ -887,18 +906,20 @@ impl Fdtd3d {
                 let ky = pml_y_kappa_h[j];
                 let kz = pml_z_kappa_h[k];
 
-                let psi_hx_y_new = pml_y_b_h[j] * 0.0 + pml_y_c_h[j] * dez_dy;
-                let psi_hx_z_new = pml_z_b_h[k] * 0.0 + pml_z_c_h[k] * dey_dz;
-                let psi_hy_x_new = pml_x_b_h[i] * 0.0 + pml_x_c_h[i] * dez_dx;
-                let psi_hy_z_new = pml_z_b_h[k] * 0.0 + pml_z_c_h[k] * dex_dz;
-                let psi_hz_x_new = pml_x_b_h[i] * 0.0 + pml_x_c_h[i] * dey_dx;
-                let psi_hz_y_new = pml_y_b_h[j] * 0.0 + pml_y_c_h[j] * dex_dy;
+                // Correct CPML psi recursion: b*psi_old + c*curl (state persistence)
+                let psi_hx_y_new = pml_y_b_h[j] * psi_hx_y_snap[idx] + pml_y_c_h[j] * dez_dy;
+                let psi_hx_z_new = pml_z_b_h[k] * psi_hx_z_snap[idx] + pml_z_c_h[k] * dey_dz;
+                let psi_hy_x_new = pml_x_b_h[i] * psi_hy_x_snap[idx] + pml_x_c_h[i] * dez_dx;
+                let psi_hy_z_new = pml_z_b_h[k] * psi_hy_z_snap[idx] + pml_z_c_h[k] * dex_dz;
+                let psi_hz_x_new = pml_x_b_h[i] * psi_hz_x_snap[idx] + pml_x_c_h[i] * dey_dx;
+                let psi_hz_y_new = pml_y_b_h[j] * psi_hz_y_snap[idx] + pml_y_c_h[j] * dex_dy;
 
-                let hx_new = coeff_h * 0.0
+                // Correct H update: use actual H field (not 0.0)
+                let hx_new = coeff_h * hx_snap[idx]
                     - coeff_curl * (dez_dy / ky + psi_hx_y_new - dey_dz / kz - psi_hx_z_new);
-                let hy_new = coeff_h * 0.0
+                let hy_new = coeff_h * hy_snap[idx]
                     - coeff_curl * (dex_dz / kz + psi_hy_z_new - dez_dx / kx - psi_hy_x_new);
-                let hz_new = coeff_h * 0.0
+                let hz_new = coeff_h * hz_snap[idx]
                     - coeff_curl * (dey_dx / kx + psi_hz_x_new - dex_dy / ky - psi_hz_y_new);
 
                 (
@@ -907,20 +928,38 @@ impl Fdtd3d {
                     hy_new,
                     hz_new,
                     psi_hx_y_new,
+                    psi_hx_z_new,
                     psi_hy_x_new,
+                    psi_hy_z_new,
                     psi_hz_x_new,
+                    psi_hz_y_new,
                 )
             })
             .collect();
 
-        // Apply updates sequentially (avoids data races)
-        for (idx, hx_d, hy_d, hz_d, psi_hx_y_d, psi_hy_x_d, psi_hz_x_d) in updates {
-            self.hx[idx] += hx_d;
-            self.hy[idx] += hy_d;
-            self.hz[idx] += hz_d;
-            self.psi_hx_y[idx] += psi_hx_y_d;
-            self.psi_hy_x[idx] += psi_hy_x_d;
-            self.psi_hz_x[idx] += psi_hz_x_d;
+        // Apply updates sequentially (avoids data races); assign (not accumulate)
+        for (
+            idx,
+            hx_new,
+            hy_new,
+            hz_new,
+            psi_hx_y_v,
+            psi_hx_z_v,
+            psi_hy_x_v,
+            psi_hy_z_v,
+            psi_hz_x_v,
+            psi_hz_y_v,
+        ) in updates
+        {
+            self.hx[idx] = hx_new;
+            self.hy[idx] = hy_new;
+            self.hz[idx] = hz_new;
+            self.psi_hx_y[idx] = psi_hx_y_v;
+            self.psi_hx_z[idx] = psi_hx_z_v;
+            self.psi_hy_x[idx] = psi_hy_x_v;
+            self.psi_hy_z[idx] = psi_hy_z_v;
+            self.psi_hz_x[idx] = psi_hz_x_v;
+            self.psi_hz_y[idx] = psi_hz_y_v;
         }
     }
 
@@ -940,6 +979,9 @@ impl Fdtd3d {
             .flat_map(|k| (1..ny - 1).flat_map(move |j| (1..nx - 1).map(move |i| (i, j, k))))
             .collect();
 
+        let ex_snap: Vec<f64> = self.ex.clone();
+        let ey_snap: Vec<f64> = self.ey.clone();
+        let ez_snap: Vec<f64> = self.ez.clone();
         let hx_snap: Vec<f64> = self.hx.clone();
         let hy_snap: Vec<f64> = self.hy.clone();
         let hz_snap: Vec<f64> = self.hz.clone();
@@ -954,15 +996,24 @@ impl Fdtd3d {
         let pml_z_b_e: Vec<f64> = self.pml_z.b_e.clone();
         let pml_z_c_e: Vec<f64> = self.pml_z.c_e.clone();
         let pml_z_kappa_e: Vec<f64> = self.pml_z.kappa_e.clone();
+        // Snapshots of all 6 psi_e fields for correct b*psi_old recursion
+        let psi_ex_y_snap: Vec<f64> = self.psi_ex_y.clone();
+        let psi_ex_z_snap: Vec<f64> = self.psi_ex_z.clone();
+        let psi_ey_x_snap: Vec<f64> = self.psi_ey_x.clone();
+        let psi_ey_z_snap: Vec<f64> = self.psi_ey_z.clone();
+        let psi_ez_x_snap: Vec<f64> = self.psi_ez_x.clone();
+        let psi_ez_y_snap: Vec<f64> = self.psi_ez_y.clone();
 
-        let updates: Vec<(usize, f64, f64, f64)> = cells
+        // Return tuple: (idx, ex_new, ey_new, ez_new, psi_ex_y, psi_ex_z, psi_ey_x, psi_ey_z, psi_ez_x, psi_ez_y)
+        let updates: Vec<EUpdateEntry> = cells
             .par_iter()
             .map(|&(i, j, k)| {
                 let idx = k * (nx * ny) + j * nx + i;
-                let eps = EPSILON_0 * eps_r_snap[idx];
+                let eps = EPSILON_0 * eps_r_snap[idx].max(1.0);
                 let sig = sigma_e_snap[idx];
                 let num = 1.0 - sig * dt / (2.0 * eps);
                 let den = 1.0 + sig * dt / (2.0 * eps);
+                let coeff_e = num / den;
                 let coeff_curl = (dt / eps) / den;
 
                 let dhz_dy = (hz_snap[idx] - hz_snap[k * (nx * ny) + (j - 1) * nx + i]) / dy;
@@ -976,29 +1027,60 @@ impl Fdtd3d {
                 let ky = pml_y_kappa_e[j];
                 let kz = pml_z_kappa_e[k];
 
-                let psi_ex_y = pml_y_b_e[j] * 0.0 + pml_y_c_e[j] * dhz_dy;
-                let psi_ex_z = pml_z_b_e[k] * 0.0 + pml_z_c_e[k] * dhy_dz;
-                let psi_ey_x = pml_x_b_e[i] * 0.0 + pml_x_c_e[i] * dhz_dx;
-                let psi_ey_z = pml_z_b_e[k] * 0.0 + pml_z_c_e[k] * dhx_dz;
-                let psi_ez_x = pml_x_b_e[i] * 0.0 + pml_x_c_e[i] * dhy_dx;
-                let psi_ez_y = pml_y_b_e[j] * 0.0 + pml_y_c_e[j] * dhx_dy;
+                // Correct CPML psi recursion: b*psi_old + c*curl (state persistence)
+                let psi_ex_y_new = pml_y_b_e[j] * psi_ex_y_snap[idx] + pml_y_c_e[j] * dhz_dy;
+                let psi_ex_z_new = pml_z_b_e[k] * psi_ex_z_snap[idx] + pml_z_c_e[k] * dhy_dz;
+                let psi_ey_x_new = pml_x_b_e[i] * psi_ey_x_snap[idx] + pml_x_c_e[i] * dhz_dx;
+                let psi_ey_z_new = pml_z_b_e[k] * psi_ey_z_snap[idx] + pml_z_c_e[k] * dhx_dz;
+                let psi_ez_x_new = pml_x_b_e[i] * psi_ez_x_snap[idx] + pml_x_c_e[i] * dhy_dx;
+                let psi_ez_y_new = pml_y_b_e[j] * psi_ez_y_snap[idx] + pml_y_c_e[j] * dhx_dy;
 
-                let _ = (
-                    num, psi_ex_y, psi_ex_z, psi_ey_x, psi_ey_z, psi_ez_x, psi_ez_y,
-                );
+                // Correct E update: include psi contributions and conductivity term (coeff_e * E_old)
+                let ex_new = coeff_e * ex_snap[idx]
+                    + coeff_curl * (dhz_dy / ky + psi_ex_y_new - dhy_dz / kz - psi_ex_z_new);
+                let ey_new = coeff_e * ey_snap[idx]
+                    + coeff_curl * (dhx_dz / kz + psi_ey_z_new - dhz_dx / kx - psi_ey_x_new);
+                let ez_new = coeff_e * ez_snap[idx]
+                    + coeff_curl * (dhy_dx / kx + psi_ez_x_new - dhx_dy / ky - psi_ez_y_new);
 
-                let ex_d = coeff_curl * (dhz_dy / ky - dhy_dz / kz);
-                let ey_d = coeff_curl * (dhx_dz / kz - dhz_dx / kx);
-                let ez_d = coeff_curl * (dhy_dx / kx - dhx_dy / ky);
-
-                (idx, ex_d, ey_d, ez_d)
+                (
+                    idx,
+                    ex_new,
+                    ey_new,
+                    ez_new,
+                    psi_ex_y_new,
+                    psi_ex_z_new,
+                    psi_ey_x_new,
+                    psi_ey_z_new,
+                    psi_ez_x_new,
+                    psi_ez_y_new,
+                )
             })
             .collect();
 
-        for (idx, ex_d, ey_d, ez_d) in updates {
-            self.ex[idx] += ex_d;
-            self.ey[idx] += ey_d;
-            self.ez[idx] += ez_d;
+        // Apply updates sequentially (avoids data races); assign (not accumulate)
+        for (
+            idx,
+            ex_new,
+            ey_new,
+            ez_new,
+            psi_ex_y_v,
+            psi_ex_z_v,
+            psi_ey_x_v,
+            psi_ey_z_v,
+            psi_ez_x_v,
+            psi_ez_y_v,
+        ) in updates
+        {
+            self.ex[idx] = ex_new;
+            self.ey[idx] = ey_new;
+            self.ez[idx] = ez_new;
+            self.psi_ex_y[idx] = psi_ex_y_v;
+            self.psi_ex_z[idx] = psi_ex_z_v;
+            self.psi_ey_x[idx] = psi_ey_x_v;
+            self.psi_ey_z[idx] = psi_ey_z_v;
+            self.psi_ez_x[idx] = psi_ez_x_v;
+            self.psi_ez_y[idx] = psi_ez_y_v;
         }
     }
 
