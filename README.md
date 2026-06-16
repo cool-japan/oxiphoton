@@ -16,11 +16,11 @@ The library is organized into 63 public modules spanning over 516 Rust source fi
 
 With 4,304 passing tests and 10 runnable examples, oxiphoton is designed for correctness and ergonomics. The API is strongly typed throughout — wavelengths, frequencies, refractive indices, field components, and geometric quantities are all distinct types with compile-time unit safety and automatic conversions.
 
-## Status (v0.1.2 — 2026-06-16)
+## Status (v0.1.3 — 2026-06-16)
 
 | Metric | Value |
 |--------|-------|
-| Version | 0.1.2 |
+| Version | 0.1.3 |
 | Release date | 2026-06-16 |
 | Rust source files | 516 |
 | Lines of code | 145,200 (178,677 total) |
@@ -218,9 +218,9 @@ cargo run --example ring_resonator
 oxiphoton is built on the COOLJAPAN pure-Rust ecosystem:
 
 ```
-oxiblas 0.1.2  (pure-Rust BLAS/LAPACK)
-oxifft  0.1.3  (pure-Rust FFT)
-    └── oxiphoton 0.1.2
+oxiblas 0.2.1  (pure-Rust BLAS/LAPACK)
+oxifft  0.3.2  (pure-Rust FFT)
+    └── oxiphoton 0.1.3
 ```
 
 **Core dependencies:**
@@ -232,8 +232,8 @@ oxifft  0.1.3  (pure-Rust FFT)
 | `thiserror` | 2.0 | Ergonomic error types |
 | `bytemuck` | 1.25 | Safe transmutes for GPU/SIMD buffers |
 | `log` | 0.4 | Structured logging |
-| `oxiblas` | 0.1.2 | Pure-Rust BLAS/LAPACK (no OpenBLAS) |
-| `oxifft` | 0.1.3 | Pure-Rust FFT (no FFTW) |
+| `oxiblas` | 0.2.1 | Pure-Rust BLAS/LAPACK (no OpenBLAS) |
+| `oxifft` | 0.3.2 | Pure-Rust FFT (no FFTW) |
 | `rayon` | 1.11 | Data parallelism (optional, `parallel` feature) |
 
 There are zero C or Fortran dependencies in the default feature set. All numerical kernels — matrix factorization, FFT, eigensolvers — are implemented in pure Rust via the COOLJAPAN ecosystem crates.
