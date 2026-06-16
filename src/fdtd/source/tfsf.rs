@@ -776,6 +776,348 @@ impl TfsfSource3d {
         }
     }
 
+    /// Flat index for 3D array with k-major layout: k*(nx*ny) + j*nx + i.
+    ///
+    /// Used by [`apply_e_correction_kfirst`] and [`apply_h_correction_kfirst`]
+    /// to match the indexing convention of [`crate::fdtd::Fdtd3d`].
+    #[inline]
+    fn idx_kfirst(i: usize, j: usize, k: usize, nx: usize, ny: usize) -> usize {
+        k * (nx * ny) + j * nx + i
+    }
+
+    /// Apply E-field corrections using k-major array layout (k*(nx*ny)+j*nx+i).
+    ///
+    /// Equivalent to [`TfsfSource3d::apply_e_correction`] but uses the k-major indexing
+    /// convention of [`crate::fdtd::Fdtd3d`] rather than the default i-major
+    /// convention.  Must be called AFTER the regular 3D E-field update.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_e_correction_kfirst(
+        &self,
+        ex: &mut [f64],
+        ey: &mut [f64],
+        ez: &mut [f64],
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+    ) {
+        let coeff_x = self.aux_dt / (EPS0 * dx);
+        let coeff_y = self.aux_dt / (EPS0 * dy);
+        let coeff_z = self.aux_dt / (EPS0 * dz);
+        let e_inc = self.e_inc_at_offset(0);
+        let h_inc = self.h_inc_at_offset(0);
+
+        // Face k = k_min (bottom XY face, normal = -Z, TF side is above)
+        if self.k_min < nz {
+            for i in self.i_min..=self.i_max.min(nx.saturating_sub(1)) {
+                for j in self.j_min..=self.j_max.min(ny.saturating_sub(1)) {
+                    let idx = Self::idx_kfirst(i, j, self.k_min, nx, ny);
+                    match self.polarization {
+                        Polarization3d::Ex => {
+                            if idx < ex.len() {
+                                ex[idx] -= coeff_z * h_inc;
+                            }
+                        }
+                        Polarization3d::Ey => {
+                            if idx < ey.len() {
+                                ey[idx] += coeff_z * h_inc;
+                            }
+                        }
+                        Polarization3d::Ez => {
+                            if idx < ez.len() {
+                                ez[idx] += coeff_x * e_inc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face k = k_max+1 (top XY face, normal = +Z, SF side is above)
+        let k_top = self.k_max + 1;
+        if k_top < nz {
+            for i in self.i_min..=self.i_max.min(nx.saturating_sub(1)) {
+                for j in self.j_min..=self.j_max.min(ny.saturating_sub(1)) {
+                    let idx = Self::idx_kfirst(i, j, k_top, nx, ny);
+                    match self.polarization {
+                        Polarization3d::Ex => {
+                            if idx < ex.len() {
+                                ex[idx] += coeff_z * h_inc;
+                            }
+                        }
+                        Polarization3d::Ey => {
+                            if idx < ey.len() {
+                                ey[idx] -= coeff_z * h_inc;
+                            }
+                        }
+                        Polarization3d::Ez => {
+                            if idx < ez.len() {
+                                ez[idx] -= coeff_x * e_inc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face j = j_min (front XZ face, normal = -Y)
+        if self.j_min < ny {
+            for i in self.i_min..=self.i_max.min(nx.saturating_sub(1)) {
+                for k in self.k_min..=self.k_max.min(nz.saturating_sub(1)) {
+                    let idx = Self::idx_kfirst(i, self.j_min, k, nx, ny);
+                    match self.polarization {
+                        Polarization3d::Ex => {
+                            if idx < ex.len() {
+                                ex[idx] += coeff_y * e_inc;
+                            }
+                        }
+                        Polarization3d::Ey => {}
+                        Polarization3d::Ez => {
+                            if idx < ez.len() {
+                                ez[idx] -= coeff_y * h_inc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face j = j_max+1 (back XZ face, normal = +Y)
+        let j_back = self.j_max + 1;
+        if j_back < ny {
+            for i in self.i_min..=self.i_max.min(nx.saturating_sub(1)) {
+                for k in self.k_min..=self.k_max.min(nz.saturating_sub(1)) {
+                    let idx = Self::idx_kfirst(i, j_back, k, nx, ny);
+                    match self.polarization {
+                        Polarization3d::Ex => {
+                            if idx < ex.len() {
+                                ex[idx] -= coeff_y * e_inc;
+                            }
+                        }
+                        Polarization3d::Ey => {}
+                        Polarization3d::Ez => {
+                            if idx < ez.len() {
+                                ez[idx] += coeff_y * h_inc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face i = i_min (left YZ face, normal = -X)
+        if self.i_min < nx {
+            for j in self.j_min..=self.j_max.min(ny.saturating_sub(1)) {
+                for k in self.k_min..=self.k_max.min(nz.saturating_sub(1)) {
+                    let idx = Self::idx_kfirst(self.i_min, j, k, nx, ny);
+                    match self.polarization {
+                        Polarization3d::Ex => {}
+                        Polarization3d::Ey => {
+                            if idx < ey.len() {
+                                ey[idx] -= coeff_x * e_inc;
+                            }
+                        }
+                        Polarization3d::Ez => {
+                            if idx < ez.len() {
+                                ez[idx] += coeff_x * h_inc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face i = i_max+1 (right YZ face, normal = +X)
+        let i_right = self.i_max + 1;
+        if i_right < nx {
+            for j in self.j_min..=self.j_max.min(ny.saturating_sub(1)) {
+                for k in self.k_min..=self.k_max.min(nz.saturating_sub(1)) {
+                    let idx = Self::idx_kfirst(i_right, j, k, nx, ny);
+                    match self.polarization {
+                        Polarization3d::Ex => {}
+                        Polarization3d::Ey => {
+                            if idx < ey.len() {
+                                ey[idx] += coeff_x * e_inc;
+                            }
+                        }
+                        Polarization3d::Ez => {
+                            if idx < ez.len() {
+                                ez[idx] -= coeff_x * h_inc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply H-field corrections using k-major array layout (k*(nx*ny)+j*nx+i).
+    ///
+    /// Equivalent to [`TfsfSource3d::apply_h_correction`] but uses the k-major indexing
+    /// convention of [`crate::fdtd::Fdtd3d`].  Must be called AFTER the regular
+    /// 3D H-field update.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_h_correction_kfirst(
+        &self,
+        hx: &mut [f64],
+        hy: &mut [f64],
+        hz: &mut [f64],
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        dx: f64,
+        dy: f64,
+        dz: f64,
+    ) {
+        let coeff_x = self.aux_dt / (MU0 * dx);
+        let coeff_y = self.aux_dt / (MU0 * dy);
+        let coeff_z = self.aux_dt / (MU0 * dz);
+        let e_inc = self.e_inc_at_offset(0);
+        let h_inc = self.h_inc_at_offset(0);
+
+        // Face k = k_min (bottom XY face)
+        if self.k_min > 0 {
+            let k = self.k_min - 1;
+            for i in self.i_min..=self.i_max.min(nx.saturating_sub(1)) {
+                for j in self.j_min..=self.j_max.min(ny.saturating_sub(1)) {
+                    let idx = Self::idx_kfirst(i, j, k, nx, ny);
+                    match self.polarization {
+                        Polarization3d::Ex => {
+                            if idx < hx.len() {
+                                hx[idx] -= coeff_z * e_inc;
+                            }
+                        }
+                        Polarization3d::Ey => {
+                            if idx < hy.len() {
+                                hy[idx] += coeff_z * e_inc;
+                            }
+                        }
+                        Polarization3d::Ez => {
+                            if idx < hz.len() {
+                                hz[idx] -= coeff_x * h_inc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face k = k_max (top XY face)
+        let k = self.k_max.min(nz.saturating_sub(1));
+        for i in self.i_min..=self.i_max.min(nx.saturating_sub(1)) {
+            for j in self.j_min..=self.j_max.min(ny.saturating_sub(1)) {
+                let idx = Self::idx_kfirst(i, j, k, nx, ny);
+                match self.polarization {
+                    Polarization3d::Ex => {
+                        if idx < hx.len() {
+                            hx[idx] += coeff_z * e_inc;
+                        }
+                    }
+                    Polarization3d::Ey => {
+                        if idx < hy.len() {
+                            hy[idx] -= coeff_z * e_inc;
+                        }
+                    }
+                    Polarization3d::Ez => {
+                        if idx < hz.len() {
+                            hz[idx] += coeff_x * h_inc;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face j = j_min (front XZ face)
+        if self.j_min > 0 {
+            let j = self.j_min - 1;
+            for i in self.i_min..=self.i_max.min(nx.saturating_sub(1)) {
+                for k in self.k_min..=self.k_max.min(nz.saturating_sub(1)) {
+                    let idx = Self::idx_kfirst(i, j, k, nx, ny);
+                    match self.polarization {
+                        Polarization3d::Ex => {
+                            if idx < hx.len() {
+                                hx[idx] -= coeff_y * h_inc;
+                            }
+                        }
+                        Polarization3d::Ey => {}
+                        Polarization3d::Ez => {
+                            if idx < hz.len() {
+                                hz[idx] += coeff_y * e_inc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face j = j_max (back XZ face)
+        let j = self.j_max.min(ny.saturating_sub(1));
+        for i in self.i_min..=self.i_max.min(nx.saturating_sub(1)) {
+            for k in self.k_min..=self.k_max.min(nz.saturating_sub(1)) {
+                let idx = Self::idx_kfirst(i, j, k, nx, ny);
+                match self.polarization {
+                    Polarization3d::Ex => {
+                        if idx < hx.len() {
+                            hx[idx] += coeff_y * h_inc;
+                        }
+                    }
+                    Polarization3d::Ey => {}
+                    Polarization3d::Ez => {
+                        if idx < hz.len() {
+                            hz[idx] -= coeff_y * e_inc;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face i = i_min (left YZ face)
+        if self.i_min > 0 {
+            let i = self.i_min - 1;
+            for j in self.j_min..=self.j_max.min(ny.saturating_sub(1)) {
+                for k in self.k_min..=self.k_max.min(nz.saturating_sub(1)) {
+                    let idx = Self::idx_kfirst(i, j, k, nx, ny);
+                    match self.polarization {
+                        Polarization3d::Ex => {}
+                        Polarization3d::Ey => {
+                            if idx < hy.len() {
+                                hy[idx] -= coeff_x * h_inc;
+                            }
+                        }
+                        Polarization3d::Ez => {
+                            if idx < hz.len() {
+                                hz[idx] += coeff_x * e_inc;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Face i = i_max (right YZ face)
+        let i = self.i_max.min(nx.saturating_sub(1));
+        for j in self.j_min..=self.j_max.min(ny.saturating_sub(1)) {
+            for k in self.k_min..=self.k_max.min(nz.saturating_sub(1)) {
+                let idx = Self::idx_kfirst(i, j, k, nx, ny);
+                match self.polarization {
+                    Polarization3d::Ex => {}
+                    Polarization3d::Ey => {
+                        if idx < hy.len() {
+                            hy[idx] += coeff_x * h_inc;
+                        }
+                    }
+                    Polarization3d::Ez => {
+                        if idx < hz.len() {
+                            hz[idx] -= coeff_x * e_inc;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Returns the current incident E-field value from the auxiliary grid.
     pub fn current_e_inc(&self) -> f64 {
         self.e_inc_at_offset(0)

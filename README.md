@@ -12,24 +12,24 @@
 
 **oxiphoton** is a full-stack photonics simulation library written entirely in Rust. It provides production-grade implementations of the core algorithms used in modern photonic design and research: Finite-Difference Time-Domain (FDTD) in 2D and 3D, the Beam Propagation Method (BPM), Transfer Matrix / S-matrix methods, Rigorous Coupled-Wave Analysis (RCWA), finite-difference and FEM mode solvers, and geometric ray tracing — alongside a rich material database, type-safe unit system, and device library for silicon photonics.
 
-The library is organized into 63 public modules spanning over 503 Rust source files (~141 K lines of implementation). It is part of the COOLJAPAN ecosystem and depends only on pure-Rust crates: linear algebra via **oxiblas**, FFT via **oxifft**, and standard scientific helpers. There are no C, Fortran, or unsafe-heavy native bindings in the default build.
+The library is organized into 63 public modules spanning over 516 Rust source files (~145 K lines of implementation). It is part of the COOLJAPAN ecosystem and depends only on pure-Rust crates: linear algebra via **oxiblas**, FFT via **oxifft**, and standard scientific helpers. There are no C, Fortran, or unsafe-heavy native bindings in the default build.
 
-With 4,264 passing tests and 11 runnable examples, oxiphoton is designed for correctness and ergonomics. The API is strongly typed throughout — wavelengths, frequencies, refractive indices, field components, and geometric quantities are all distinct types with compile-time unit safety and automatic conversions.
+With 4,304 passing tests and 10 runnable examples, oxiphoton is designed for correctness and ergonomics. The API is strongly typed throughout — wavelengths, frequencies, refractive indices, field components, and geometric quantities are all distinct types with compile-time unit safety and automatic conversions.
 
-## Status (v0.1.1 — 2026-05-03)
+## Status (v0.1.2 — 2026-06-16)
 
 | Metric | Value |
 |--------|-------|
-| Version | 0.1.1 |
-| Release date | 2026-05-03 |
-| Rust source files | 503 |
-| Lines of code | 141,044 (172,763 total) |
+| Version | 0.1.2 |
+| Release date | 2026-06-16 |
+| Rust source files | 516 |
+| Lines of code | 145,200 (178,677 total) |
 | Public modules | 63 |
 | Public API items | 7,595 |
 | Public types / traits | 1,086 |
-| Passing tests | 4,264 (zero failures) |
-| Runnable examples | 11 |
-| Criterion benchmarks | 3 |
+| Passing tests | 4,304 (zero failures) |
+| Runnable examples | 10 |
+| Criterion benchmarks | 4 |
 | C/Fortran dependencies | 0 |
 | MSRV | Rust 1.75, Edition 2021 |
 
@@ -84,20 +84,20 @@ With 4,264 passing tests and 11 runnable examples, oxiphoton is designed for cor
 | `mode-solver` | yes | Finite-difference and FEM waveguide mode solvers |
 | `ray-optics` | yes | Geometric ray tracing, ABCD matrices, aberration analysis |
 | `dispersive` | yes | Dispersive media models: Drude, Lorentz, Sellmeier, Cauchy, Brendel-Bormann |
-| `nonlinear` | yes | Nonlinear FDTD: Kerr, Raman, SHG |
+| `nonlinear` | no | Nonlinear FDTD: Kerr, Raman, SHG |
 | `photonic-crystal` | yes | Band structure calculations, defect modes, DOS |
 | `siph-devices` | yes | Silicon photonics device library |
-| `metalens` | yes | Metasurface and metalens design tools |
+| `metalens` | no | Metasurface and metalens design tools |
 | `fiber` | yes | Fiber optics: NLSE, solitons, supercontinuum, PCF, sensing |
-| `interconnect` | yes | WDM channel planning, link budget calculation |
+| `interconnect` | no | WDM channel planning, link budget calculation |
 | `solar-optics` | yes | Solar cell absorption with AM1.5 spectrum |
-| `inverse-design` | yes | Adjoint-based inverse design |
-| `topology-opt` | yes | Topology optimization |
+| `inverse-design` | no | Adjoint-based inverse design |
+| `topology-opt` | no | Topology optimization |
 | `materials-builtin` | yes | Built-in material database (Si, SiO2, Au, Ag, GaAs, InP, graphene, …) |
-| `io-gds` | yes | GDS layout I/O |
-| `io-vtk` | yes | VTK file I/O |
+| `io-gds` | no | GDS layout I/O |
+| `io-vtk` | no | VTK file I/O |
 | `io-hdf5` | no | HDF5 file I/O |
-| `io-oxirs` | yes | OxiRS file format I/O |
+| `io-oxirs` | no | OxiRS file format I/O |
 | `parallel` | no | Rayon multi-threading for FDTD and mode solvers |
 | `simd` | no | SIMD acceleration for inner loops |
 | `gpu-wgpu` | no | GPU compute via wgpu |
@@ -199,6 +199,7 @@ The `examples/` directory contains runnable demonstrations:
 | `anisotropic_crystal` | FDTD simulation of wave propagation in an anisotropic crystal |
 | `bloch_band_structure` | Photonic crystal band structure with Bloch boundary conditions |
 | `fdtd_3d_waveguide` | 3D FDTD simulation of a dielectric waveguide |
+| `fdtd_gpu_acceleration` | CPU vs GPU FDTD comparison (2D TE + 3D), requires `gpu-wgpu` feature |
 | `graphene_plasmon` | Graphene surface plasmon polariton simulation |
 | `ring_modulator` | Silicon ring modulator frequency response |
 | `ring_resonator` | Ring resonator transmission spectrum via TMM |
@@ -219,7 +220,7 @@ oxiphoton is built on the COOLJAPAN pure-Rust ecosystem:
 ```
 oxiblas 0.1.2  (pure-Rust BLAS/LAPACK)
 oxifft  0.1.3  (pure-Rust FFT)
-    └── oxiphoton 0.1.1
+    └── oxiphoton 0.1.2
 ```
 
 **Core dependencies:**
@@ -242,7 +243,7 @@ There are zero C or Fortran dependencies in the default feature set. All numeric
 - **Parallelism**: Enable the `parallel` feature to activate Rayon-based threading across FDTD time steps, mode solver iterations, and spectrum sweeps. Scales linearly with core count on large grids.
 - **SIMD**: The `simd` feature enables explicit SIMD intrinsics in Yee-cell update loops (x86-64 AVX2 and ARM NEON).
 - **GPU**: The `gpu-wgpu` feature offloads FDTD field updates to the GPU via wgpu compute shaders, targeting both Vulkan and Metal backends.
-- **Benchmarks**: Three Criterion benchmark suites cover 2D FDTD throughput, TMM spectral sweep, and mode solver convergence. Run with `cargo bench`.
+- **Benchmarks**: Four Criterion benchmark suites cover 2D FDTD throughput, TMM spectral sweep, mode solver convergence, and GPU FDTD acceleration. Run with `cargo bench`.
 
 ## License
 

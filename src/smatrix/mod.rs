@@ -1,5 +1,6 @@
 pub mod eigenmode;
 pub mod interface;
+pub mod mie;
 pub mod rcwa;
 #[allow(clippy::module_inception)]
 pub mod smatrix;
@@ -22,6 +23,7 @@ pub use eigenmode::{
     EmeSegment, EmeSolver, SMatrix2x2, SMatrixNd,
 };
 pub use interface::{interface_smatrix, EmeStack, InterfaceError};
+pub use mie::{MieResult, SphereScatter};
 pub use rcwa::{GratingLayer, RcwaResult, RcwaSolver};
 pub use smatrix::SMatrixN;
 pub use transfer_matrix::{Layer, TransferMatrix, TransferMatrixResult};

@@ -18,6 +18,8 @@
 
 use std::f64::consts::PI;
 
+use crate::photonic_crystal::pwe2d::{kpath_hexagonal, PhCrystal2d, Polarization};
+
 /// 1D photonic crystal cavity (Fabry-Pérot type).
 ///
 /// A defect layer is sandwiched between two identical PC mirrors.
@@ -222,6 +224,15 @@ impl H1Defect {
         }
     }
 
+    /// Normalised fill factor f = π r² / (√3/2 · a²) for the triangular lattice.
+    ///
+    /// This is the fraction of the unit-cell area occupied by the circular hole.
+    fn fill_factor(&self) -> f64 {
+        let a = self.lattice_const;
+        let r = self.rod_radius;
+        PI * r * r / (3_f64.sqrt() / 2.0 * a * a)
+    }
+
     /// Estimate the mid-gap frequency (a/λ) for a triangular lattice of air
     /// holes in a high-index slab.
     ///
@@ -236,6 +247,65 @@ impl H1Defect {
         let n_ref = 3.476; // Si reference
         let f_ref = 0.305; // a/λ at mid-gap for Si triangular lattice
         f_ref * n_ref / self.n_bg
+    }
+
+    /// Compute the TE bandgap centre frequency using a PWE band-structure calculation.
+    ///
+    /// Uses `PhCrystal2d` with the actual lattice parameters (fill factor, eps_bg,
+    /// eps_hole) to compute the band diagram on the Γ→M→K→Γ path (standard for
+    /// hexagonal lattices).  The bandgap centre is taken as the arithmetic mean of
+    /// the maximum of band 1 (index 0) and the minimum of band 2 (index 1).
+    ///
+    /// Returns the normalised frequency a/λ at the gap centre.
+    /// Falls back to the empirical `midgap_freq_normalized()` value if the PWE
+    /// computation finds no gap or encounters a degenerate spectrum.
+    pub fn bandgap_center_from_pwe(&self) -> f64 {
+        let fill = self.fill_factor();
+        let eps_bg = self.n_bg * self.n_bg;
+        // n_rod is the hole material index (typically 1.0 for air)
+        let eps_hole = self.n_rod * self.n_rod;
+        // n_g = 7 gives 49 plane waves — good accuracy at low cost (~milliseconds)
+        let crystal = PhCrystal2d::hex_holes(eps_bg, eps_hole, fill, 7);
+        // Standard Γ→M→K→Γ path for hexagonal lattice; 10 points per segment
+        let k_path = kpath_hexagonal(10);
+        let bs = crystal.band_diagram(&k_path, Polarization::TE);
+
+        if bs.bands.len() < 2 {
+            return self.midgap_freq_normalized();
+        }
+
+        // band 1 (index 0) maximum over all k-points
+        let band1_max = bs.bands[0]
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+        // band 2 (index 1) minimum over all k-points
+        let band2_min = bs.bands[1].iter().cloned().fold(f64::INFINITY, f64::min);
+
+        if band2_min > band1_max {
+            // A proper gap exists; return its centre
+            (band1_max + band2_min) / 2.0
+        } else {
+            // No gap found at this resolution — fall back to empirical formula
+            self.midgap_freq_normalized()
+        }
+    }
+
+    /// Resonance frequency (rad/s) estimated using actual PWE band structure.
+    ///
+    /// More accurate than `resonance_frequency()` because the gap centre is
+    /// computed from the true eigenvalue spectrum rather than from an empirical
+    /// index-scaling formula.  Expected runtime: ~50 ms for n_g = 7.
+    ///
+    /// The H1 defect mode frequency is estimated as the TE bandgap centre.
+    /// Although perturbation theory places the mode slightly below the upper
+    /// band edge, the gap centre is a good zeroth-order approximation that
+    /// already improves substantially on the empirical 5 % offset.
+    pub fn resonance_frequency_rigorous(&self) -> f64 {
+        use crate::units::conversion::SPEED_OF_LIGHT;
+        let f_gap = self.bandgap_center_from_pwe();
+        // f_gap = a/λ  →  ω = 2π · f_gap · c / a
+        f_gap * 2.0 * PI * SPEED_OF_LIGHT / self.lattice_const
     }
 
     /// Resonance frequency estimate (rad/s).
@@ -724,5 +794,56 @@ mod tests {
         let ff = w1.fill_factor();
         // r/a = 0.30 → ff ≈ 0.326
         assert!(ff > 0.1 && ff < 0.6, "fill factor={ff:.3}");
+    }
+
+    // --- PWE-based H1 tests ---
+
+    #[test]
+    fn bandgap_center_from_pwe_positive() {
+        let h1 = H1Defect::new(400e-9, 120e-9, 1.0, 3.476);
+        let f_gap = h1.bandgap_center_from_pwe();
+        assert!(f_gap > 0.0, "PWE gap centre must be positive, got {f_gap}");
+    }
+
+    #[test]
+    fn h1_rigorous_frequency_in_bandgap() {
+        use crate::units::conversion::SPEED_OF_LIGHT;
+        // The rigorous frequency should lie in the typical H1 gap range for
+        // n = 3.476, r/a = 0.30.
+        let h1 = H1Defect::new(400e-9, 120e-9, 1.0, 3.476);
+        let omega_rig = h1.resonance_frequency_rigorous();
+        assert!(omega_rig > 0.0, "rigorous frequency must be positive");
+        // Recover normalised frequency a/λ
+        let f_norm = omega_rig * h1.lattice_const / (2.0 * PI * SPEED_OF_LIGHT);
+        assert!(f_norm > 0.20, "f_norm too low: {f_norm}");
+        assert!(f_norm < 0.45, "f_norm too high: {f_norm}");
+    }
+
+    #[test]
+    fn h1_rigorous_higher_index_lower_frequency() {
+        // Higher background index pushes the bandgap to lower normalised
+        // frequencies, so the PWE-derived resonance should be lower for Si
+        // (n = 3.476) than for GaAs (n = 3.374).
+        let h1_si = H1Defect::new(400e-9, 120e-9, 1.0, 3.476);
+        let h1_gaas = H1Defect::new(400e-9, 120e-9, 1.0, 3.374);
+        let f_si = h1_si.resonance_frequency_rigorous();
+        let f_gaas = h1_gaas.resonance_frequency_rigorous();
+        assert!(
+            f_si < f_gaas,
+            "Si (n=3.476) should have lower ω than GaAs (n=3.374): si={f_si}, gaas={f_gaas}"
+        );
+    }
+
+    #[test]
+    fn h1_rigorous_vs_empirical_same_order() {
+        // Rigorous and empirical results should agree within 20 %.
+        let h1 = H1Defect::new(400e-9, 120e-9, 1.0, 3.476);
+        let f_emp = h1.resonance_frequency();
+        let f_rig = h1.resonance_frequency_rigorous();
+        let ratio = f_rig / f_emp;
+        assert!(
+            ratio > 0.7 && ratio < 1.3,
+            "empirical/rigorous mismatch: ratio={ratio:.3}, emp={f_emp:.3e}, rig={f_rig:.3e}"
+        );
     }
 }

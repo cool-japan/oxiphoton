@@ -320,6 +320,205 @@ impl GnlseSolver {
             .collect()
     }
 
+    /// Apply the linear dispersion operator exp(D̂·h) in the frequency domain.
+    ///
+    /// D̂(ω) = i·φ_D(ω) − α/2, where φ_D(ω) is the dispersion phase per unit
+    /// length (rad/m) as returned by `dispersion_phase`.  The complex exponential
+    /// is applied in-place to `field_freq`, which must already be in FFT-order.
+    fn apply_linear_propagator(&self, field_freq: &mut [Complex64], h: f64) {
+        let n = field_freq.len();
+        let omegas = omega_axis(n, self.dt);
+        for (a, &om) in field_freq.iter_mut().zip(omegas.iter()) {
+            let phi = self.dispersion_phase(om);
+            let attenuation = (-self.alpha * h / 2.0).exp();
+            *a *= Complex64::new(0.0, phi * h).exp() * attenuation;
+        }
+    }
+
+    /// Compute the nonlinear operator N̂[A] = i·γ · (nonlinear polarisation).
+    ///
+    /// Returns i·γ times the nonlinear coupling field produced by
+    /// `nonlinear_step`.  This operator is used as the right-hand-side source
+    /// term in the RK4IP integrator.
+    fn nl_operator(&self, field: &[Complex64], omega0: f64) -> Vec<Complex64> {
+        let nl = self.nonlinear_step(field, omega0);
+        nl.into_iter()
+            .map(|v| v * Complex64::new(0.0, self.gamma))
+            .collect()
+    }
+
+    /// Advance the field by one step of size `h` using the fourth-order
+    /// Runge-Kutta in the interaction picture (RK4IP) method.
+    ///
+    /// Implements Table 1 of Hult, J. Lightw. Technol. 25, 3770 (2007).
+    /// The interaction picture removes the stiff linear part so that the
+    /// four-stage Runge-Kutta integration only acts on the nonlinear term.
+    ///
+    /// # Steps
+    /// ```text
+    ///   A_I  = IFFT[ exp(L̂·h/2) · FFT[A_n] ]   (half-step linear propagation)
+    ///   k1   = h · N̂(A_I)
+    ///   k2   = h · N̂( IFFT[exp(L̂·h/2)·FFT[A_I]] + k1/2 )
+    ///   k3   = h · N̂( IFFT[exp(L̂·h/2)·FFT[A_I]] + k2/2 )
+    ///   k4   = h · N̂( IFFT[exp(L̂·h) ·FFT[A_I + k3/h]] )
+    ///   A_{n+1} = IFFT[exp(L̂·h/2) · FFT[A_I + k1/6 + k2/3 + k3/3]] + k4/6
+    /// ```
+    pub fn rk4ip_step(&self, field: &[Complex64], omega0: f64, h: f64) -> Vec<Complex64> {
+        // Helper: apply L̂·h_half to a time-domain field and return time-domain result.
+        let apply_half_disp = |f: &[Complex64]| -> Vec<Complex64> {
+            let mut freq: Vec<Complex64> = f.to_vec();
+            fft_inplace(&mut freq);
+            self.apply_linear_propagator(&mut freq, h / 2.0);
+            ifft_inplace(&mut freq);
+            freq
+        };
+
+        let apply_full_disp = |f: &[Complex64]| -> Vec<Complex64> {
+            let mut freq: Vec<Complex64> = f.to_vec();
+            fft_inplace(&mut freq);
+            self.apply_linear_propagator(&mut freq, h);
+            ifft_inplace(&mut freq);
+            freq
+        };
+
+        // A_I = exp(L̂·h/2) · A_n  — the interaction-picture field at z.
+        let a_i = apply_half_disp(field);
+
+        // k1 = h · N̂(A_I)
+        let k1: Vec<Complex64> = self
+            .nl_operator(&a_i, omega0)
+            .into_iter()
+            .map(|v| v * h)
+            .collect();
+
+        // k2 = h · N̂( exp(L̂·h/2)·A_I + k1/2 )
+        let k2_input: Vec<Complex64> = apply_half_disp(&a_i)
+            .into_iter()
+            .zip(k1.iter())
+            .map(|(a, &k)| a + k * 0.5)
+            .collect();
+        let k2: Vec<Complex64> = self
+            .nl_operator(&k2_input, omega0)
+            .into_iter()
+            .map(|v| v * h)
+            .collect();
+
+        // k3 = h · N̂( exp(L̂·h/2)·A_I + k2/2 )
+        let k3_input: Vec<Complex64> = apply_half_disp(&a_i)
+            .into_iter()
+            .zip(k2.iter())
+            .map(|(a, &k)| a + k * 0.5)
+            .collect();
+        let k3: Vec<Complex64> = self
+            .nl_operator(&k3_input, omega0)
+            .into_iter()
+            .map(|v| v * h)
+            .collect();
+
+        // k4 = h · N̂( exp(L̂·h) · (A_I + k3) )
+        let k4_input: Vec<Complex64> = apply_full_disp(&a_i)
+            .into_iter()
+            .zip(k3.iter())
+            .map(|(a, &k)| a + k)
+            .collect();
+        let k4: Vec<Complex64> = self
+            .nl_operator(&k4_input, omega0)
+            .into_iter()
+            .map(|v| v * h)
+            .collect();
+
+        // A_{n+1} = exp(L̂·h/2) · (A_I + k1/6 + k2/3 + k3/3) + k4/6
+        let combined: Vec<Complex64> = a_i
+            .iter()
+            .zip(k1.iter())
+            .zip(k2.iter())
+            .zip(k3.iter())
+            .map(|(((a, k1v), k2v), k3v)| a + k1v / 6.0 + k2v / 3.0 + k3v / 3.0)
+            .collect();
+        let propagated = apply_half_disp(&combined);
+        propagated
+            .into_iter()
+            .zip(k4.iter())
+            .map(|(a, &k)| a + k / 6.0)
+            .collect()
+    }
+
+    /// Propagate the input field adaptively using RK4IP with step-doubling
+    /// error control (Sinkin et al., Opt. Express 11, 3514 (2003)).
+    ///
+    /// At each trial step of size `h`:
+    /// 1. Take one RK4IP step of size `h`       → A_full.
+    /// 2. Take two RK4IP steps of size `h/2`    → A_half (more accurate).
+    /// 3. Local error = ||A_full − A_half||₂ / ||A_half||₂.
+    /// 4. Accept if err < `tol`; use A_half as the new field.
+    /// 5. Update h via the classical 5th-order control formula:
+    ///    `h_new = h · min((tol/err)^0.2, h_max/h)`.
+    /// 6. Reject if err ≥ tol (and h > h_min): halve h and retry.
+    ///
+    /// Returns `(output_field, number_of_accepted_steps)`.
+    pub fn propagate_adaptive(
+        &self,
+        input_field: &[Complex64],
+        omega0: f64,
+        tol: f64,
+    ) -> (Vec<Complex64>, usize) {
+        let n = input_field.len();
+        assert_eq!(
+            n, self.n_time_points,
+            "input_field length {} must equal n_time_points {}",
+            n, self.n_time_points
+        );
+
+        let mut field = input_field.to_vec();
+        let mut z = 0.0_f64;
+        let z_end = self.fiber_length;
+        let mut h = self.dz;
+        let h_min = self.dz * 0.001;
+        let h_max = self.dz * 16.0;
+        let mut n_steps = 0_usize;
+
+        while z < z_end {
+            // Clamp h to remaining distance (never below h_min).
+            h = h.min(z_end - z).max(h_min);
+
+            // Full step with h.
+            let a_full = self.rk4ip_step(&field, omega0, h);
+
+            // Two half-steps with h/2 (higher-order accurate estimate).
+            let a_half1 = self.rk4ip_step(&field, omega0, h / 2.0);
+            let a_half = self.rk4ip_step(&a_half1, omega0, h / 2.0);
+
+            // Local relative error estimate via step-doubling.
+            let err_sq: f64 = a_full
+                .iter()
+                .zip(a_half.iter())
+                .map(|(&af, &ah)| (af - ah).norm_sqr())
+                .sum();
+            let norm_sq: f64 = a_half.iter().map(|&a| a.norm_sqr()).sum();
+            let err = if norm_sq > 1e-300 {
+                (err_sq / norm_sq).sqrt()
+            } else {
+                0.0
+            };
+
+            if err < tol || h <= h_min {
+                // Accept: advance with the more accurate two-half-step result.
+                field = a_half;
+                z += h;
+                n_steps += 1;
+                // Adjust step size (classical 5th-order control).
+                if err > 0.0 {
+                    h = (h * (tol / err).powf(0.2)).min(h_max);
+                }
+            } else {
+                // Reject: shrink step and retry.
+                h *= 0.5;
+            }
+        }
+
+        (field, n_steps)
+    }
+
     /// Estimate the 10 dB spectral bandwidth in nanometres.
     ///
     /// Converts the FFT-ordered spectrum to wavelength bins using λ = 2πc/(ω₀+Δω),

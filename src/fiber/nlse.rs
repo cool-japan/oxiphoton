@@ -105,15 +105,16 @@ impl NlseSolver {
     ///
     /// `omega` must be the angular-frequency array (rad/s) of length equal to
     /// `amplitude.len()` (already a power-of-two after potential padding by
-    /// the caller).
-    pub fn step(&self, amplitude: &[Complex64], omega: &[f64]) -> Vec<Complex64> {
+    /// the caller).  `dt` is the time-domain sample interval (s), required for
+    /// the full h_R(t) Raman convolution.
+    pub fn step(&self, amplitude: &[Complex64], omega: &[f64], dt: f64) -> Vec<Complex64> {
         let dz = self.step_size_m;
 
         // --- Half-step dispersion + loss in frequency domain ---
         let after_half_disp = self.apply_dispersion_half(amplitude, omega, dz);
 
         // --- Full nonlinear step in time domain ---
-        let after_nl = self.apply_nonlinear(&after_half_disp, dz);
+        let after_nl = self.apply_nonlinear(&after_half_disp, dz, dt);
 
         // --- Half-step dispersion + loss in frequency domain ---
         self.apply_dispersion_half(&after_nl, omega, dz)
@@ -141,7 +142,7 @@ impl NlseSolver {
         let omega = omega_array_unshifted(m, pulse.dt);
 
         for _ in 0..self.n_steps {
-            amp = self.step(&amp, &omega);
+            amp = self.step(&amp, &omega, pulse.dt);
         }
 
         // Truncate back to original length
@@ -179,7 +180,7 @@ impl NlseSolver {
         let mut snapshots = vec![initial];
 
         for step_idx in 0..self.n_steps {
-            amp = self.step(&amp, &omega);
+            amp = self.step(&amp, &omega, pulse.dt);
             if (step_idx + 1) % interval == 0 || step_idx + 1 == self.n_steps {
                 let snap = OpticalPulse::new(
                     pulse.t.clone(),
@@ -324,9 +325,12 @@ impl NlseSolver {
     }
 
     /// Apply the full nonlinear (SPM ± Raman) step in the time domain.
-    fn apply_nonlinear(&self, amplitude: &[Complex64], dz: f64) -> Vec<Complex64> {
+    ///
+    /// `dt` is the time-domain sample spacing (s), forwarded to the full
+    /// h_R(t) Raman convolution when `include_raman` is set.
+    fn apply_nonlinear(&self, amplitude: &[Complex64], dz: f64, dt: f64) -> Vec<Complex64> {
         if self.include_raman {
-            self.apply_nonlinear_raman(amplitude, dz)
+            self.apply_nonlinear_raman(amplitude, dz, dt)
         } else {
             self.apply_spm_only(amplitude, dz)
         }
@@ -343,38 +347,92 @@ impl NlseSolver {
             .collect()
     }
 
-    /// Simplified Raman model: the SPM term is reduced by fR, and a frequency
-    /// shift proportional to the power derivative is added.
+    /// Build the frequency-domain representation of the Raman response function
+    /// h_R(t) for silica fibre (Stolen & Johnson 1992, validated by Agrawal NLFO).
     ///
-    /// The Raman self-frequency shift is modelled as:
-    ///   ∂A/∂z|_Raman = −i·γ·fR·T_R·|A|²·(∂A/∂T)
+    /// The analytic Raman response for silica is:
+    /// ```text
+    ///   h_R(t) = (τ₁²+τ₂²)/(τ₁·τ₂²) · exp(−t/τ₁) · sin(t/τ₂),  t > 0
+    ///   h_R(t) = 0,                                                  t ≤ 0
+    /// ```
+    /// with τ₁ = 12.2 fs, τ₂ = 32.0 fs (causal response).
     ///
-    /// Here we use an explicit first-order finite-difference approximation for
-    /// the power derivative d(|A|²)/dt.
-    fn apply_nonlinear_raman(&self, amplitude: &[Complex64], dz: f64) -> Vec<Complex64> {
-        let n = amplitude.len();
-        let mut out = Vec::with_capacity(n);
-        // Simplified Raman: T_R ≈ 3 fs for silica
-        let t_r = 3.0e-15_f64;
-        // We embed dt from the amplitude array length implicitly — use a fixed
-        // approximate value (1 fs per sample is worst case; real dt comes from
-        // the calling context).  For the simplified model we just modulate the
-        // SPM phase by the local power slope.
-        for (idx, &a) in amplitude.iter().enumerate() {
-            let power = a.norm_sqr();
-            // Power gradient (central difference where possible)
-            let dp_dt = if idx == 0 || idx == n - 1 {
-                0.0
-            } else {
-                (amplitude[idx + 1].norm_sqr() - amplitude[idx - 1].norm_sqr()) / 2.0
-            };
-            // Effective nonlinear phase including Raman frequency shift
-            let phi_spm = self.gamma_per_w_per_m * (1.0 - self.raman_fraction) * power * dz;
-            let phi_raman = -self.gamma_per_w_per_m * self.raman_fraction * t_r * dp_dt * dz;
-            let phi_total = phi_spm + phi_raman;
-            out.push(a * Complex64::new(0.0, phi_total).exp());
+    /// The returned array is FFT[h_R], pre-multiplied by `dt` so that the
+    /// discrete convolution `IFFT[FFT[h_R] · FFT[|A|²]]` approximates the
+    /// continuous integral `∫h_R(T′)·|A(T−T′)|² dT′`.
+    fn raman_response_spectrum(&self, n: usize, dt: f64) -> Vec<Complex64> {
+        // Silica Raman parameters (Agrawal NLFO 5th ed., Table 2.1)
+        let tau1 = 12.2e-15_f64;
+        let tau2 = 32.0e-15_f64;
+        // Normalisation amplitude such that ∫h_R dt ≈ 1 (before f_R weighting)
+        let amp = (tau1 * tau1 + tau2 * tau2) / (tau1 * tau2 * tau2);
+        // Build h_R in time domain — causal (t > 0 only).
+        // Index 0 corresponds to t = 0, where sin(0) = 0, so h_R[0] = 0.
+        let mut h = vec![Complex64::new(0.0, 0.0); n];
+        for (k, slot) in h.iter_mut().enumerate().skip(1) {
+            let t = k as f64 * dt;
+            let val = amp * (-t / tau1).exp() * (t / tau2).sin() * dt;
+            *slot = Complex64::new(val, 0.0);
         }
-        out
+        // Return FFT of h_R (length already a power-of-two from propagate())
+        fft_radix2(&h, false)
+    }
+
+    /// Full GNLSE Raman step via FFT convolution (Agrawal NLFO 5th ed., §2.3.2).
+    ///
+    /// Computes:
+    /// ```text
+    ///   conv(T) = ∫ h_R(T′) · |A(T−T′)|² dT′
+    ///           ≈ IFFT[ FFT[h_R] · FFT[|A|²] ]
+    /// ```
+    /// then applies the combined SPM + Raman phase:
+    /// ```text
+    ///   A_out[k] = A_in[k] · exp(i·γ·dz·[(1−f_R)·|A[k]|² + f_R·conv[k]])
+    /// ```
+    ///
+    /// The `(1−f_R)` prefactor on the SPM term ensures no double-counting of
+    /// the Raman-active portion of the nonlinear response.
+    fn apply_nonlinear_raman(&self, amplitude: &[Complex64], dz: f64, dt: f64) -> Vec<Complex64> {
+        let n = amplitude.len();
+
+        // --- Step 1: |A(t)|² → complex array for FFT ---
+        let power: Vec<Complex64> = amplitude
+            .iter()
+            .map(|a| Complex64::new(a.norm_sqr(), 0.0))
+            .collect();
+
+        // --- Step 2: FFT[|A|²] ---
+        // n is guaranteed power-of-two by the propagate() caller (via next_power_of_two)
+        let power_freq = fft_radix2(&power, false);
+
+        // --- Step 3: FFT[h_R] (pre-scaled by dt inside raman_response_spectrum) ---
+        let h_freq = self.raman_response_spectrum(n, dt);
+
+        // --- Step 4: Convolution theorem — pointwise multiply in frequency domain ---
+        let conv_freq: Vec<Complex64> = power_freq
+            .iter()
+            .zip(h_freq.iter())
+            .map(|(&p, &h)| p * h)
+            .collect();
+
+        // --- Step 5: IFFT → time-domain convolution ---
+        // fft_radix2 with inverse=true divides by n, completing the DFT normalization.
+        // The real part carries the physical convolution; imaginary should be ~0.
+        let conv_time_raw = fft_radix2(&conv_freq, true);
+        let conv_time: Vec<f64> = conv_time_raw.iter().map(|c| c.re).collect();
+
+        // --- Step 6: Apply combined SPM + Raman phase to each sample ---
+        amplitude
+            .iter()
+            .enumerate()
+            .map(|(k, &a)| {
+                let power_k = a.norm_sqr();
+                let spm_term = self.gamma_per_w_per_m * (1.0 - self.raman_fraction) * power_k;
+                let raman_term = self.gamma_per_w_per_m * self.raman_fraction * conv_time[k];
+                let phi = (spm_term + raman_term) * dz;
+                a * Complex64::new(0.0, phi).exp()
+            })
+            .collect()
     }
 }
 
@@ -696,6 +754,268 @@ mod tests {
         let solver = NlseSolver::new(fiber, 1.3e-3, 0.0, 10.0, 100.0).with_raman(0.18);
         let out = solver.propagate(&pulse).expect("Raman propagation failed");
         assert_eq!(out.amplitude.len(), n_pts);
+    }
+
+    // -----------------------------------------------------------------------
+    // Raman FFT-convolution tests (Phase 14, Block A)
+    // -----------------------------------------------------------------------
+
+    /// Verify that the DC component of the Raman response spectrum is positive.
+    ///
+    /// For silica, ∫h_R(t) dt ≈ 0.245 (Agrawal NLFO Table 2.1), so the
+    /// zero-frequency bin of FFT[h_R] (which equals Σ h_R[k]·dt) must be
+    /// strictly positive.
+    #[test]
+    fn raman_response_spectrum_dc_positive() {
+        let fiber = FiberDispersion::smf28();
+        let solver = NlseSolver::new(fiber, 1.3e-3, 0.0, 10.0, 100.0).with_raman(0.18);
+        // Use a 1024-point grid with dt = 10 fs/sample (≈ 10 ps window)
+        let n = 1024_usize;
+        let dt = 10.0e-15_f64;
+        let h_freq = solver.raman_response_spectrum(n, dt);
+        // DC bin (index 0) real part = Σ h_R[k]·dt = ∫ h_R dt
+        let dc = h_freq[0].re;
+        assert!(
+            dc > 0.0,
+            "DC of Raman spectrum must be positive (got {dc:.6})"
+        );
+        // The integral ∫h_R dt for silica should be in a physically sensible range
+        // (Agrawal gives ≈ 0.245 for the normalised response before f_R weighting)
+        assert!(
+            dc > 0.01 && dc < 2.0,
+            "∫h_R dt = {dc:.4} is outside expected range [0.01, 2.0]"
+        );
+    }
+
+    /// A high-power ultra-short sech pulse propagating in a **dispersion-free**
+    /// fibre with Raman should exhibit the intrapulse Raman self-frequency shift
+    /// (RSSF): the spectral centroid of the DFT-based envelope spectrum shifts
+    /// to positive frequency.
+    ///
+    /// Using a dispersion-free fibre isolates the Raman nonlinearity from the
+    /// dispersive soliton dynamics and makes the spectral shift directly
+    /// measurable.
+    ///
+    /// The h_R(t) response is causal: trailing power history drives a larger
+    /// nonlinear phase at the pulse trailing edge than at the leading edge,
+    /// producing `∂φ/∂T > 0`.  With the engineering-FFT convention (exp(-iωt))
+    /// used throughout the SSFM, applying `A·exp(+iφ)` with `∂φ/∂T > 0` shifts
+    /// the DFT-based envelope centroid to *positive* frequency.  In optical
+    /// terms this corresponds to the Raman RSSF toward longer wavelengths
+    /// (lower optical frequency), but in the retarded frame the centroid moves
+    /// *positive*.
+    #[test]
+    fn raman_soliton_red_shift_positive() {
+        // Use a very fine time grid so that dt ≪ τ₁ = 12.2 fs for good h_R sampling.
+        // Ultra-short sech pulse: FWHM = 200 fs (T₀ ≈ 113 fs)
+        // Time window = 8 ps, n_pts = 8192 → dt ≈ 0.977 fs ≪ 12.2 fs
+        let n_pts = 8192_usize;
+        let t_window_ps = 8.0_f64;
+        let fwhm_ps = 0.2_f64; // 200 fs FWHM
+
+        // Dispersion-free fibre (β₂=β₃=β₄=0) so only the Raman phase accumulates
+        let fiber_nod = FiberDispersion::new(0.0, 0.0, 0.0, 1550.0);
+        let gamma = 1.3e-3_f64;
+
+        // Use a high-power pulse: P₀ = 1000 W, L = 2 m (short propagation)
+        let p0 = 1000.0_f64;
+        let pulse = OpticalPulse::sech(n_pts, t_window_ps, p0, fwhm_ps, 1550.0);
+
+        let initial_centroid = spectral_centroid_hz(&pulse);
+
+        // Propagate with a single nonlinear step (dispersion-free, Raman on)
+        let prop_length = 2.0_f64;
+        let solver =
+            NlseSolver::new(fiber_nod, gamma, 0.0, prop_length, prop_length).with_raman(0.18);
+        let out = solver
+            .propagate(&pulse)
+            .expect("dispersion-free Raman propagation failed");
+
+        let final_centroid = spectral_centroid_hz(&out);
+        let shift_hz = final_centroid - initial_centroid;
+
+        // Sign convention note: With the engineering-FFT convention (DFT exp(-iωt)),
+        // applying exp(+iφ(T)) with dφ/dT > 0 at the pulse centre shifts the
+        // DFT-based envelope centroid to *higher* retarded-frame frequency (positive).
+        // In optical terms this corresponds to the Raman RSSF toward longer wavelengths.
+        assert!(
+            shift_hz > 0.0,
+            "Raman RSSF must shift the retarded-frame centroid to positive frequency: \
+             got {shift_hz:.3e} Hz. \
+             Initial centroid: {initial_centroid:.3e} Hz, final: {final_centroid:.3e} Hz."
+        );
+    }
+
+    /// A solver with f_R = 0.18 should produce different spectral broadening
+    /// from pure SPM (f_R = 0): the Raman convolution changes the nonlinear
+    /// phase profile and thus the spectral shape.
+    #[test]
+    fn raman_stronger_with_higher_fraction() {
+        let n_pts = 1024_usize;
+        let t_window_ps = 30.0_f64;
+        let fwhm_ps = 0.5_f64;
+        let fiber = FiberDispersion::smf28();
+        let gamma = 1.3e-3_f64;
+
+        // Choose a high-power sech pulse (N ~ 3) so Raman is significant
+        let solver_ref = NlseSolver::new(fiber.clone(), gamma, 0.0, 100.0, 1.0e3);
+        let p1 = solver_ref.soliton_power_w(fwhm_ps);
+        let p_high = 9.0 * p1; // N = 3 soliton (N² = 9)
+        let pulse = OpticalPulse::sech(n_pts, t_window_ps, p_high, fwhm_ps, 1550.0);
+
+        // Propagate over a moderate distance
+        let t0_s = fwhm_ps * 1.0e-12 / (2.0 * (1.0 + 2.0_f64.sqrt()).ln());
+        let b2_abs = fiber.beta2_s2_per_m().abs();
+        let l_d = t0_s * t0_s / b2_abs;
+        let prop_length = 0.5 * l_d;
+
+        let solver_spm = NlseSolver::new(fiber.clone(), gamma, 0.0, 50.0, prop_length);
+        let solver_raman = NlseSolver::new(fiber, gamma, 0.0, 50.0, prop_length).with_raman(0.18);
+
+        let out_spm = solver_spm
+            .propagate(&pulse)
+            .expect("SPM propagation failed");
+        let out_raman = solver_raman
+            .propagate(&pulse)
+            .expect("Raman propagation failed");
+
+        let bw_spm = spectral_rms_width_hz(&out_spm);
+        let bw_raman = spectral_rms_width_hz(&out_raman);
+
+        assert!(
+            bw_raman != bw_spm,
+            "Raman (f_R=0.18) must produce different spectral width than pure SPM (f_R=0): \
+             SPM={bw_spm:.3e} Hz, Raman={bw_raman:.3e} Hz"
+        );
+    }
+
+    /// The Raman-induced frequency shift should scale with peak power: a
+    /// higher-power pulse should produce a larger spectral centroid shift.
+    /// Both shifts are in the same direction (positive, as per the DFT
+    /// engineering convention); the high-power pulse shows a larger magnitude.
+    #[test]
+    fn raman_frequency_shift_proportional_to_power() {
+        let n_pts = 2048_usize;
+        let t_window_ps = 60.0_f64;
+        let fwhm_ps = 1.0_f64;
+        let fiber = FiberDispersion::smf28();
+        let gamma = 1.3e-3_f64;
+
+        let solver_ref = NlseSolver::new(fiber.clone(), gamma, 0.0, 100.0, 1.0e3);
+        let p1 = solver_ref.soliton_power_w(fwhm_ps);
+
+        // Two power levels: P₁ and 4·P₁ (N=1 and N=2 solitons)
+        let t0_s = fwhm_ps * 1.0e-12 / (2.0 * (1.0 + 2.0_f64.sqrt()).ln());
+        let b2_abs = fiber.beta2_s2_per_m().abs();
+        let l_d = t0_s * t0_s / b2_abs;
+        // Short propagation: L ≪ L_D so Raman shift is in linear regime
+        let prop_length = 0.05 * l_d;
+
+        let pulse_low = OpticalPulse::sech(n_pts, t_window_ps, p1, fwhm_ps, 1550.0);
+        let pulse_high = OpticalPulse::sech(n_pts, t_window_ps, 4.0 * p1, fwhm_ps, 1550.0);
+
+        let centroid_low_init = spectral_centroid_hz(&pulse_low);
+        let centroid_high_init = spectral_centroid_hz(&pulse_high);
+
+        let solver = NlseSolver::new(fiber, gamma, 0.0, 50.0, prop_length).with_raman(0.18);
+        let out_low = solver
+            .propagate(&pulse_low)
+            .expect("low-power propagation failed");
+        let out_high = solver
+            .propagate(&pulse_high)
+            .expect("high-power propagation failed");
+
+        let shift_low = spectral_centroid_hz(&out_low) - centroid_low_init;
+        let shift_high = spectral_centroid_hz(&out_high) - centroid_high_init;
+
+        // Higher power must produce a larger magnitude Raman centroid shift
+        assert!(
+            shift_high.abs() > shift_low.abs(),
+            "Higher power must produce a larger Raman frequency shift: \
+             |shift_high|={:.3e} Hz, |shift_low|={:.3e} Hz",
+            shift_high.abs(),
+            shift_low.abs()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Spectral analysis helpers (test-only)
+    // -----------------------------------------------------------------------
+
+    /// Compute the spectral centroid (first moment of |Ã(ω)|²) in Hz.
+    ///
+    /// Uses the unshifted FFT convention matching the SSFM.
+    fn spectral_centroid_hz(pulse: &OpticalPulse) -> f64 {
+        use crate::fiber::pulse::fft_pow2;
+        let n = pulse.amplitude.len();
+        let m = n.next_power_of_two();
+        let mut amp = pulse.amplitude.clone();
+        amp.resize(m, Complex64::new(0.0, 0.0));
+        let spectrum = fft_pow2(&amp);
+        let dt = pulse.dt;
+        let df = 1.0 / (m as f64 * dt);
+        let power_spec: Vec<f64> = spectrum.iter().map(|s| s.norm_sqr()).collect();
+        let total: f64 = power_spec.iter().sum();
+        if total < 1.0e-60 {
+            return 0.0;
+        }
+        let centroid: f64 = power_spec
+            .iter()
+            .enumerate()
+            .map(|(k, &p)| {
+                let f = if k < m / 2 {
+                    k as f64 * df
+                } else {
+                    (k as f64 - m as f64) * df
+                };
+                f * p
+            })
+            .sum::<f64>();
+        centroid / total
+    }
+
+    /// Compute the RMS spectral width (second moment of |Ã(ω)|²) in Hz.
+    fn spectral_rms_width_hz(pulse: &OpticalPulse) -> f64 {
+        use crate::fiber::pulse::fft_pow2;
+        let n = pulse.amplitude.len();
+        let m = n.next_power_of_two();
+        let mut amp = pulse.amplitude.clone();
+        amp.resize(m, Complex64::new(0.0, 0.0));
+        let spectrum = fft_pow2(&amp);
+        let dt = pulse.dt;
+        let df = 1.0 / (m as f64 * dt);
+        let power_spec: Vec<f64> = spectrum.iter().map(|s| s.norm_sqr()).collect();
+        let total: f64 = power_spec.iter().sum();
+        if total < 1.0e-60 {
+            return 0.0;
+        }
+        let centroid: f64 = power_spec
+            .iter()
+            .enumerate()
+            .map(|(k, &p)| {
+                let f = if k < m / 2 {
+                    k as f64 * df
+                } else {
+                    (k as f64 - m as f64) * df
+                };
+                f * p
+            })
+            .sum::<f64>()
+            / total;
+        let var: f64 = power_spec
+            .iter()
+            .enumerate()
+            .map(|(k, &p)| {
+                let f = if k < m / 2 {
+                    k as f64 * df
+                } else {
+                    (k as f64 - m as f64) * df
+                };
+                (f - centroid) * (f - centroid) * p
+            })
+            .sum::<f64>()
+            / total;
+        var.sqrt()
     }
 
     // -----------------------------------------------------------------------

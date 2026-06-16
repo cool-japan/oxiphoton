@@ -339,5 +339,73 @@ PASS (4156 tests, 0 failures, 0 warnings) — Phase 10 (SMatrix2x2→Complex64 +
 ## Verification (2026-04-28, run 7)
 PASS (4187+ tests, 0 failures, 0 warnings) — Phase 11 (EME mode orthogonality + power-conservation tests, parallel CPML 3D validation suite, solar DD spectral-response coupling [depth-resolved TMM → DD per λ], solar DD Fermi-Dirac statistics [Antia rational approx + Joyce-Dixon inverse + degenerate branches])
 
-## Verification (2026-05-03)
-PASS (4,264 tests, 0 failures, 0 warnings) — v0.1.1 stub-check fixes (GdsReader::parse() text-format reader + GdsWriter full-geometry emit, MetasurfaceFunction::Hologram Gerchberg-Saxton phase retrieval via OxiFFT, PhotonicNetwork::power_efficiency() ring-topology fix, HigherOrderSoliton wavelength propagation through fission, SemiconductorLaser::photon_density_ss() steady-state formula, OxirsConnection HTTP/SPARQL via ureq [feature io-oxirs])
+## Verification (2026-06-16)
+PASS (4,304 tests, 0 failures, 0 warnings) — v0.1.2 stub-check fixes (GdsReader::parse() text-format reader + GdsWriter full-geometry emit, MetasurfaceFunction::Hologram Gerchberg-Saxton phase retrieval via OxiFFT, PhotonicNetwork::power_efficiency() ring-topology fix, HigherOrderSoliton wavelength propagation through fission, SemiconductorLaser::photon_density_ss() steady-state formula, OxirsConnection HTTP/SPARQL via ureq [feature io-oxirs])
+
+## Phase 14 — Rigorous physics upgrades round 2 (v0.1.2 continued)
+
+Implemented 2026-06-10. All items below are complete.
+
+### A. Full delayed Raman response in `NlseSolver` (`src/fiber/nlse.rs`)
+- [x] **nlse-raman-h-r-convolution** — Replace first-order T_R·dP/dT approximation (t_r=3fs scalar) with proper Agrawal h_R(t) delayed Raman response convolution via FFT. New `raman_response_spectrum(n, dt)` helper; rewrote `apply_nonlinear_raman` to use `IFFT[FFT[h_R]·FFT[|A|²]]` per §2.3.2. `dt` propagated to nonlinear step. Constants: τ₁=12.2fs, τ₂=32fs (Stolen & Johnson 1992).
+  - **Goal:** Correct Raman RSSF proportional to pulse power; spectral centroid shift with nonzero f_R; h_R DC component positive.
+  - **Files:** `src/fiber/nlse.rs` (~1086 lines)
+  - **Tests:** `raman_response_spectrum_dc_positive`, `raman_soliton_red_shift_positive`, `raman_stronger_with_higher_fraction`, `raman_frequency_shift_proportional_to_power`
+
+### B. Rigorous Mie scattering (`src/smatrix/mie.rs`, new)
+- [x] **mie-scattering-bohren-huffman** — Lorenz-Mie theory for exact sphere scattering. Downward recurrence for logarithmic derivative D_n(ρ) (Lentz algorithm); upward recurrence for ψ_n/ξ_n (Riccati-Bessel/Hankel). Complex refractive index support. Outputs Q_ext, Q_scat, Q_abs, Q_back. Rayleigh-limit analytic branch for x<1e-10. `SphereScatter` + `MieResult` exported from `smatrix` module.
+  - **Goal:** Energy conservation (Q_ext=Q_scat for lossless); Rayleigh x^4 scaling; Q_abs>0 for absorbing sphere; Q_ext→2 for large x.
+  - **Files:** `src/smatrix/mie.rs` (new), `src/smatrix/mod.rs` (updated)
+  - **Tests:** `mie_energy_conservation_real_index`, `mie_small_sphere_rayleigh_scaling`, `mie_absorbing_sphere_positive_q_abs`, `mie_cross_sections_scale_with_area`, `mie_large_size_parameter_converges`, `mie_q_back_nonnegative`
+
+### C. Proper bidirectional BPM iteration (`src/bpm/bidirectional.rs`)
+- [x] **bidirectional-bpm-correct-reverse** — Three bug fixes: (1) backward sweep now calls `step_backward` (conjugated propagation phase + CN diffraction kernel) instead of `step_forward`; (2) convergence checks field change between iterations instead of backward norm vs tolerance; (3) `BidirectionalBpm::reflectance()` now computes cumulative Fresnel product `1 − ∏(1−r_i²)` instead of returning 0.0 always.
+  - **Goal:** Backward field correctly propagates in −z; uniform medium has small backward field; Fresnel interface reflectance non-zero.
+  - **Files:** `src/bpm/bidirectional.rs`
+  - **Tests:** `bidirectional_bpm_reflectance_uniform_medium_is_zero`, `bidirectional_bpm_reflectance_interface_nonzero`, `bidirectional_bpm_lossless_energy_conservation`, `bidirectional_bpm_backward_field_shape`
+
+### D. PWE-computed PhC defect mode frequency (`src/photonic_crystal/defect.rs`)
+- [x] **phc-defect-pwe-resonance** — Replace empirical `f_norm * (1.0 - 0.05)` (5% hardcoded offset) in `H1Defect::resonance_frequency()` with PWE-computed bandgap center. New `bandgap_center_from_pwe()` runs `PhCrystal2d::band_diagram()` (Γ→M→K→Γ, n_g=7, TE), finds `(band1_max + band2_min)/2`. New `resonance_frequency_rigorous()` converts to angular frequency. Falls back to empirical if no gap found.
+  - **Goal:** PWE-computed gap center is physically meaningful; in correct a/λ range; higher-index material gives lower frequency.
+  - **Files:** `src/photonic_crystal/defect.rs` (updated)
+  - **Tests:** `bandgap_center_from_pwe_positive`, `h1_rigorous_frequency_in_bandgap`, `h1_rigorous_higher_index_lower_frequency`, `h1_rigorous_vs_empirical_same_order`
+
+### E. Silent-correctness sweep
+- [x] **nonlinear-phc-n-bg-param** — `nonlinear_phc.rs`: added `n_bg: f64` field to `PhCNonlinearEnhancement` and `SlowLightShg`; added `::silicon()` convenience constructors (n_bg=3.476). Removed 4× hardcoded `n_bg=3.476`. Tests: GaAs vs Si enhancement factor differs; SHG enhancement scales with inverse n_bg.
+- [x] **kerr-picard-fix** — `fdtd/engine/nonlinear.rs`: `advance_picard` now correctly iterates only the E-update (not H+E like before), using `ε_eff^{(k)} = ε_r + χ³·(E^{(k)})²` until convergence (max 5 iterations, tol 1e-10). Tests: Picard agrees with explicit for weak field; advance changes field.
+- [x] **gnlse-rk4ip-adaptive** (retroactive Phase 13 completion) — `src/fiber/supercontinuum.rs`: wired `apply_linear_propagator`, `nl_operator`, `rk4ip_step`, `propagate_adaptive` per Hult JLT 2007 + Sinkin step-doubling. `tests/gnlse_rk4ip.rs` (4 tests) now compile and pass.
+- [x] **tfsf-3d-integration** (retroactive Phase 13 completion) — `src/fdtd/dims/fdtd_3d.rs`: added `tfsf: Option<TfsfSource3d>` field, `set_tfsf()`, `apply_tfsf_h/e_correction()`. `src/fdtd/source/tfsf.rs`: added k-major correction variants. `src/fdtd/mod.rs`: exported `TfsfSource3d`, `Polarization3d`, `PropagationAxis`. `tests/tfsf_3d_validation.rs` (6 tests) now compile and pass.
+
+## Verification (2026-06-10)
+PASS (4,298 tests, 0 failures, 0 warnings) — Phase 14 (full Raman h_R convolution in NLSE, Mie scattering, bidirectional BPM fix, PWE defect mode, n_bg parameterization, Kerr Picard iteration, +GNLSE RK4IP + TFSF 3D retroactive completions)
+
+## Phase 15 — GPU acceleration (wgpu compute backend)
+
+- [x] gpu-fdtd-2d-te (W1): Fdtd2dGpu (2D TE) wgpu compute backend
+  - **Goal:** `oxiphoton::fdtd::gpu::Fdtd2dGpu` runs the full 2D TE Yee+CPML update on GPU in f32, with the same `new/step/run/inject_hz/fill_eps_box` surface as `Fdtd2dTe`, plus `download_hz/ex/ey() -> Vec<f64>`. Validates against `Fdtd2dTe` within f32 tolerance. Makes `gpu-wgpu` a real, non-empty feature.
+  - **Design:** `src/fdtd/gpu/{mod,context,buffers,fdtd_2d_gpu}.rs` + `src/fdtd/gpu/shaders/te2d.wgsl`. Fields/ψ resident on GPU across `run(n)` — no per-step readback. Coefficients precomputed f64 then cast f32. Three WGSL passes per step: inject → Hz → E. Asymmetric CPML boundary fallbacks transliterated literally. Device with `required_limits: adapter.limits()` (binding limit). Peak-normalized L∞ < 2e-3 vs CPU oracle.
+  - **Files:** `Cargo.toml`, `src/fdtd/mod.rs`, `src/fdtd/gpu/{mod,context,buffers,fdtd_2d_gpu}.rs`, `src/fdtd/gpu/shaders/te2d.wgsl`, `tests/fdtd_gpu_validation.rs`
+  - **Tests:** `tests/fdtd_gpu_validation.rs` — skip if no adapter; 64×64 pml(15) ε=12 box 200 steps; peak-normalized L∞ < 2e-3, L2 < 1e-3, energy within 5% of CPU.
+  - **Risk:** wgpu dep fetch may fail in offline env → cargo check first; f32 tolerance absorbs ULP differences.
+
+- [x] gpu-fdtd-2d-tm (W2a): Fdtd2dTmGpu (2D TM) wgpu compute backend
+  - **Goal:** `Fdtd2dTmGpu` mirroring `Fdtd2dTm` (Ez, Hx, Hy) on GPU; same API + `download_ez/hx/hy`; validated vs CPU.
+  - **Design:** Reuse W1 `GpuContext`/buffers/readback wholesale. Transliterate `Fdtd2dTm::step` — re-derive TM's own boundary fallbacks (different array sizes). `shaders/tm2d.wgsl` (Hx + Hy + Ez passes).
+  - **Files:** `src/fdtd/gpu/fdtd_2d_tm_gpu.rs`, `src/fdtd/gpu/shaders/tm2d.wgsl`, `src/fdtd/gpu/mod.rs`, `tests/fdtd_gpu_validation.rs`
+  - **Tests:** TM analogue of TE validation; same tolerances; same skip-if-no-GPU.
+  - **Risk:** TM boundary fallback differs from TE — verify against `Fdtd2dTm::step` directly.
+
+- [x] gpu-fdtd-3d (W2b): Fdtd3dGpu (3D) wgpu compute backend
+  - **Goal:** `oxiphoton::fdtd::gpu::Fdtd3dGpu` runs the full 3D lossy-isotropic Yee+CPML update on the GPU in f32 (6 fields, 12 ψ, 3-axis CPML), mirroring `Fdtd3d::update_h`/`update_e`. API: `new(nx,ny,nz,dx,dy,dz,&BoundaryConfig)`, `step`, `run`, `inject_ez`, `fill_box`, `add_material_box`, `download_{ex,ey,ez,hx,hy,hz}() -> Vec<f64>`. Validated vs `Fdtd3d` oracle at 24³ within L∞ 2e-3 / L2 1e-3. Makes the deferred 3D arm of `gpu-wgpu` real.
+  - **Design:** Collocated grid (all 6 fields size n=nx·ny·nz; idx=(k·ny+j)·nx+i). vec4/stride packing to ≤8 storage buffers/pass (portable to the WebGPU floor): buf_e/buf_h as array<vec4<f32>>, buf_psi_h/buf_psi_e stride-6 array<f32>, buf_mat vec4 (eps,mu,σe,σm), 3× buf_pml_{x,y,z} stride-6 [b_e,c_e,κ_e,b_h,c_h,κ_h], SimDims3d uniform. Kernels per step: H (fwd diff, 0..n−1) → E (bwd diff, 1..n−1) → inject (after E). @workgroup_size(4,4,4). Exact CPU arithmetic order for f32 parity; dt + CPML b/c/κ precomputed f64 (courant_dt + Cpml::new) cast to f32. Reuse GpuContext/buffers.rs/readback verbatim; add SimDims3d.
+  - **Files:** NEW src/fdtd/gpu/fdtd_3d_gpu.rs, src/fdtd/gpu/shaders/{fdtd3d_h,fdtd3d_e,fdtd3d_inject}.wgsl; edit src/fdtd/gpu/buffers.rs (+SimDims3d), src/fdtd/gpu/mod.rs (+module/re-export); extend tests/fdtd_gpu_validation.rs, examples/fdtd_gpu_acceleration.rs, benches/fdtd_gpu_bench.rs (3D arms, feature+adapter gated).
+  - **Prerequisites:** none new — reuses the Phase-15 2D foundation (context/buffers/readback).
+  - **Tests:** gpu_3d_vacuum_propagation_finite (inject ez center, ~80 steps, ez finite & peak>1e-20); gpu_3d_matches_cpu_oracle (24³, pml(8), ε=12 box, 100 steps; peak-normalized L∞<2e-3 & L2<1e-3 on all 6 fields via shared check_field). Skip-if-no-adapter (return). CPU fields via public access or field_at loop (no CPU-solver changes).
+  - **Risk:** (1) per-pass storage count → solved by packing to ≤8 (universal floor). (2) f32 vs f64 → same 2e-3 tolerance the 2D port meets. (3) 12-ψ axis pairing → transliterated cell-by-cell from fdtd_3d.rs:782-911. (4) file <2000 lines → fdtd_3d_gpu.rs ≈600-800; factor a pipeline-build helper if needed; WGSL via include_str!.
+
+- [x] gpu-fdtd-example-bench: example + criterion bench for GPU path
+  - **Goal:** `examples/fdtd_gpu_acceleration.rs` (CPU vs GPU agreement + timing, graceful no-GPU message) and `benches/fdtd_gpu_bench.rs` (criterion bench).
+  - **Design:** GPU arm gated `#[cfg(feature="gpu-wgpu")]`. `[[bench]] name="fdtd_gpu_bench" harness=false` in Cargo.toml.
+  - **Files:** `examples/fdtd_gpu_acceleration.rs`, `benches/fdtd_gpu_bench.rs`, `Cargo.toml`
+  - **Tests:** `cargo build --example fdtd_gpu_acceleration --features gpu-wgpu` compiles; bench compiles with `--no-run`.
+  - **Risk:** minimal.

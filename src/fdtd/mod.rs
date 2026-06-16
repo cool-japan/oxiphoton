@@ -44,6 +44,10 @@ pub use monitor::mode::{ModeFluxMonitor, ModeMonitor};
 pub use source::dipole::{DipoleOrientation, DipoleSrc, PurcellCalc};
 pub use source::mode_source::{ModeProfile, ModeSource};
 pub use source::plane_wave::PlaneWaveSource;
-pub use source::tfsf::{TfsfAux1d, TfsfConfig1d};
+pub use source::plane_wave::{Polarization3d, PropagationAxis};
+pub use source::tfsf::{TfsfAux1d, TfsfConfig1d, TfsfSource3d};
 pub use source::{GaussianEnvelope, GaussianModulated, SourceWaveform};
 pub use sweep::parameter::{ConvergenceSweep, ParamGrid, ParamSweep, WavelengthSweep};
+
+#[cfg(feature = "gpu-wgpu")]
+pub mod gpu;

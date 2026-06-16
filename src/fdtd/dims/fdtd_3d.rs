@@ -1,6 +1,7 @@
 use crate::fdtd::boundary::pml::Cpml;
 use crate::fdtd::config::{BoundaryConfig, Dimensions, GridSpacing};
 use crate::fdtd::courant::courant_dt;
+use crate::fdtd::source::tfsf::TfsfSource3d;
 use crate::units::conversion::{EPSILON_0, MU_0, SPEED_OF_LIGHT};
 
 /// Parallel H-update result: (idx, hx, hy, hz, psi_hx_y, psi_hx_z, psi_hy_x, psi_hy_z, psi_hz_x, psi_hz_y)
@@ -80,6 +81,9 @@ pub struct Fdtd3d {
     field_probes: Vec<FieldProbe3d>,
     plane_monitors: Vec<PlaneMonitor3d>,
     dft_probes: Vec<DftProbe3d>,
+
+    // Optional TF/SF source for plane-wave injection
+    tfsf: Option<TfsfSource3d>,
 }
 
 impl Fdtd3d {
@@ -159,6 +163,7 @@ impl Fdtd3d {
             field_probes: Vec::new(),
             plane_monitors: Vec::new(),
             dft_probes: Vec::new(),
+            tfsf: None,
         }
     }
 
@@ -356,6 +361,20 @@ impl Fdtd3d {
     }
 
     // ──────────────────────────────────────────────────────────────────────────
+    // TF/SF source
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Attach a [`TfsfSource3d`] to this solver.
+    ///
+    /// Overrides `tfsf.aux_dt` with the solver's own `dt` so that the auxiliary
+    /// 1D grid stays synchronised with the main 3D simulation.  The TFSF
+    /// corrections are automatically applied inside [`Fdtd3d::step`] and [`Fdtd3d::step_with_sources`].
+    pub fn set_tfsf(&mut self, mut tfsf: TfsfSource3d) {
+        tfsf.aux_dt = self.dt;
+        self.tfsf = Some(tfsf);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
     // Monitor registration
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -458,20 +477,76 @@ impl Fdtd3d {
     // Time stepping
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// Advance one time step (no sources or monitors).
+    /// Advance one time step (no hard sources or monitors).
+    ///
+    /// If a [`TfsfSource3d`] has been attached via [`Fdtd3d::set_tfsf`], its boundary
+    /// corrections are applied automatically on every step.
     pub fn step(&mut self) {
         self.update_h();
+        self.apply_tfsf_h_correction();
         self.update_e();
+        self.apply_tfsf_e_correction();
         self.time_step += 1;
     }
 
     /// Advance one step, applying all registered sources and recording monitors.
+    ///
+    /// TFSF corrections (if a source is attached) are applied in the correct
+    /// leapfrog order: H-correction after H update, E-correction after E update.
     pub fn step_with_sources(&mut self) {
         self.update_h();
+        self.apply_tfsf_h_correction();
         self.update_e();
+        self.apply_tfsf_e_correction();
         self.apply_sources();
         self.record_monitors();
         self.time_step += 1;
+    }
+
+    /// Apply H-field TFSF boundary corrections and advance the auxiliary grid.
+    ///
+    /// Called inside [`step`] and [`step_with_sources`] immediately after
+    /// [`update_h`].  The auxiliary grid is stepped here (before the E update)
+    /// so that `h_inc` is available at the H half-step.
+    fn apply_tfsf_h_correction(&mut self) {
+        if let Some(tfsf) = &mut self.tfsf {
+            let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+            let (dx, dy, dz) = (self.dx, self.dy, self.dz);
+            tfsf.apply_h_correction_kfirst(
+                &mut self.hx,
+                &mut self.hy,
+                &mut self.hz,
+                nx,
+                ny,
+                nz,
+                dx,
+                dy,
+                dz,
+            );
+            tfsf.step_aux();
+        }
+    }
+
+    /// Apply E-field TFSF boundary corrections.
+    ///
+    /// Called inside [`step`] and [`step_with_sources`] immediately after
+    /// [`update_e`].
+    fn apply_tfsf_e_correction(&mut self) {
+        if let Some(tfsf) = &self.tfsf {
+            let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+            let (dx, dy, dz) = (self.dx, self.dy, self.dz);
+            tfsf.apply_e_correction_kfirst(
+                &mut self.ex,
+                &mut self.ey,
+                &mut self.ez,
+                nx,
+                ny,
+                nz,
+                dx,
+                dy,
+                dz,
+            );
+        }
     }
 
     /// Run for `steps` iterations (no sources or monitors).
